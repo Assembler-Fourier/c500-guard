@@ -1,0 +1,18 @@
+{
+  "name": "YOLOX-Tiny",
+  "file": "yolox_tiny.onnx",
+  "publisher": "Megvii-BaseDetection",
+  "release": "0.1.1rc0",
+  "source": "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_tiny.onnx",
+  "documentation": "https://github.com/Megvii-BaseDetection/YOLOX/tree/main/demo/ONNXRuntime",
+  "repository_license": "Apache-2.0",
+  "license_file": "YOLOX-LICENSE.txt",
+  "downloaded_utc_date": "2026-09-11",
+  "size_bytes": 20219662,
+  "sha256": "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7",
+  "checksum_source": "Locally computed after official HTTPS download; publisher release API digest is null",
+  "input": "float32 [1,3,416,416], BGR channels, 0..255, top-left letterbox padding=114",
+  "output": "Raw COCO predictions [1,3549,85], stride 8/16/32 decode required",
+  "training": "Publisher COCO pretrained weights; no site-specific training performed",
+  "network_required_for_inference": false
+}

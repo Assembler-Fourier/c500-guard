@@ -1,0 +1,2 @@
+# Local ORB landmarks and RANSAC; no GUI, cloud account or GPU required.
+opencv-python-headless>=4.10,<5

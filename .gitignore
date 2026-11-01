@@ -1,0 +1,19 @@
+# Never commit these
+.venv/
+.venv-backup*/
+tools/
+backups/
+models/*.onnx
+__pycache__/
+*.pyc
+snapshot.png
+*.log
+*.jsonl
+state/
+# your site-specific zones (zones.example.json is tracked instead)
+config/zones.json
+*.wav
+go2rtc
+go2rtc.exe
+*.bak-*
+.DS_Store

@@ -1,0 +1,37 @@
+--- a/pkg/xiaomi/miss/client.go
++++ b/pkg/xiaomi/miss/client.go
+@@ -72,13 +72,33 @@
+ 		return nil, err
+ 	}
+ 
+-	return &Client{Conn: conn, key: key, model: model}, nil
++	client := &Client{Conn: conn, key: key, model: model}
++	client.startCommandLoop()
++	return client, nil
+ }
+ 
+ type Client struct {
+ 	Conn
+ 	key   []byte
+ 	model string
++}
++
++// startCommandLoop consumes unsolicited control messages after authentication.
++// CS2 has a bounded command queue; leaving it unread eventually closes the
++// entire connection, including video. The existing connection owner retains
++// Close ownership: closing the connection unblocks ReadCommand and ends this
++// goroutine. The completion signal is useful for checking that lifecycle.
++func (c *Client) startCommandLoop() <-chan struct{} {
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		for {
++			if _, _, err := c.Conn.ReadCommand(); err != nil {
++				return
++			}
++		}
++	}()
++	return done
+ }
+ 
+ const (

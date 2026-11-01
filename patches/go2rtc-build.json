@@ -1,0 +1,12 @@
+{
+  "sha256": "5498de8d7073f085d19ba01890b1ad0a2ecf07183640cedb9788d6c61d284092",
+  "base_version": "v1.9.14",
+  "source": "https://github.com/AlexxIT/go2rtc/archive/refs/tags/v1.9.14.zip",
+  "source_archive_sha256": "a7a4e68f0b6269a5273b1c0e2f4105a7ad1459251640eef6ed8d3b010a7f1885",
+  "fix": "Drain Xiaomi MISS command responses after authentication to prevent command queue overflow",
+  "compiler": "go1.27.1 windows/amd64",
+  "build_flags": "CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags '-s -w'",
+  "tests": "go test ./pkg/xiaomi/miss/... passed, including three command-loop regression tests",
+  "upstream_issue": "https://github.com/AlexxIT/go2rtc/issues/2234",
+  "built_at": "2026-09-11"
+}
