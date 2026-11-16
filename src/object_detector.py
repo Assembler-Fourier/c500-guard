@@ -1,4 +1,4 @@
-"""Offline YOLOX-Tiny CPU detections, independent of the motion/fault alarm.
+"""Offline YOLOX detections, independent of the motion/fault alarm.
 
 This is a COCO-pretrained object detector, not a site-trained security model.
 Pre/postprocessing follows the official YOLOX ONNXRuntime demonstration:
@@ -22,6 +22,9 @@ MODEL_URL = "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1
 # release asset has no publisher digest; this pins the tested artifact only.
 MODEL_SHA256 = "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7"
 DEFAULT_MODEL = Path(__file__).resolve().parent.parent / "models" / "yolox_tiny.onnx"
+OPENVINO_DIR = Path(__file__).resolve().parent.parent / "tools" / "openvino"
+# "graphics": OpenVINO on the Intel graphics, else the processor. "processor": ONNX Runtime CPU only.
+ENGINE = "graphics"
 TARGET_CLASSES = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 # Suppress competing road-vehicle labels for the same object, while retaining
 # overlapping people/cycles (for example a person riding a bicycle).
@@ -72,7 +75,7 @@ def _nms(boxes: np.ndarray, scores: np.ndarray, threshold: float) -> list[int]:
 
 def decode_detections(output: np.ndarray, input_size: tuple[int, int], ratio: float,
                       frame_size: tuple[int, int], confidence: float = .45,
-                      nms_iou: float = .45) -> list[dict]:
+                      nms_iou: float = .45, normal_confidence: float | None = None) -> list[dict]:
     """Decode official YOLOX raw stride-8/16/32 output to image-pixel xyxy boxes.
 
     frame_size is (height, width). Only person and road vehicle classes return.
@@ -118,7 +121,15 @@ def decode_detections(output: np.ndarray, input_size: tuple[int, int], ratio: fl
             label = TARGET_CLASSES[class_id]
             results.append({"class_id": class_id, "label": label,
                             "confidence": round(float(scores[selected[i]]), 4),
+                            "raw_confidence": float(scores[selected[i]]),
                             "bbox": [round(float(value), 2) for value in boxes[i]]})
+    if normal_confidence is not None:
+        # Optional weak diagnostic candidates must not consume the existing
+        # 50-result budget ahead of a normal candidate merely because both
+        # display confidences round to the same value. Preserve normal order.
+        floor = float(np.float32(normal_confidence))
+        return sorted(results, key=lambda item: (item['raw_confidence'] >= floor,
+                                                 item['confidence']), reverse=True)[:50]
     return sorted(results, key=lambda item: item["confidence"], reverse=True)[:50]
 
 
@@ -134,7 +145,10 @@ class ObjectDetector:
 
     def __init__(self, model_path: str | Path = DEFAULT_MODEL, confidence: float = .45,
                  nms_iou: float = .45, threads: int = 2,
-                 expected_sha256: str | None = MODEL_SHA256):
+                 expected_sha256: str | None = MODEL_SHA256, engine: str | None = None,
+                 input_size: tuple[int, int] = (416, 416),
+                 model_label: str = "YOLOX-Tiny COCO pretrained",
+                 gpu_precision: str = "f16", allow_cpu_fallback: bool = True):
         self.model_path = Path(model_path)
         self.confidence = confidence
         self.nms_iou = nms_iou
@@ -143,8 +157,34 @@ class ObjectDetector:
         self.inference_ms = None
         self.frames_processed = 0
         self.input_size = (416, 416)
+        self.model_label = "YOLOX-Tiny COCO pretrained"
+        self.gpu_precision = "f16"
+        self.allow_cpu_fallback = True
+        self.precision = None
         self._session = None
+        self._request = None
+        self._output = None
+        self._threads = threads
+        self.provider = "CPU"
+        self.engine_note = ""
         try:
+            # A caller selects a tested profile explicitly. Neither a filename
+            # nor a graph shape identifies the model or overrides its checksum.
+            if (not isinstance(input_size, (tuple, list)) or len(input_size) != 2
+                    or any(type(value) is not int for value in input_size)
+                    or tuple(input_size) not in ((416, 416), (640, 640))):
+                raise ValueError("ML input size must be (416, 416) or (640, 640)")
+            if (not isinstance(model_label, str) or not model_label.strip()
+                    or len(model_label) > 120 or any(ord(char) < 32 for char in model_label)):
+                raise ValueError("ML model label must be nonempty plain text (at most 120 characters)")
+            if gpu_precision not in ("f16", "f32"):
+                raise ValueError("ML graphics precision must be f16 or f32")
+            if not isinstance(allow_cpu_fallback, bool):
+                raise ValueError("ML CPU fallback setting must be boolean")
+            self.input_size = tuple(input_size)
+            self.model_label = model_label.strip()
+            self.gpu_precision = gpu_precision
+            self.allow_cpu_fallback = allow_cpu_fallback
             if not 0 < confidence <= 1 or not 0 < nms_iou <= 1:
                 raise ValueError("ML confidence and NMS IoU must be in (0, 1]")
             if not self.model_path.is_file():
@@ -153,6 +193,49 @@ class ObjectDetector:
                 digest = hashlib.sha256(self.model_path.read_bytes()).hexdigest()
                 if digest != expected_sha256.lower():
                     raise ValueError("ML model checksum differs from tested official release")
+            if (engine or ENGINE) == "graphics":
+                try:
+                    self._open_graphics()
+                except Exception as exc:                          # noqa: BLE001 - fall back below
+                    self._request = None
+                    if not self.allow_cpu_fallback:
+                        raise RuntimeError(f"Graphics initialization failed; CPU fallback disabled: {exc}") from exc
+                    self.engine_note = (f"Intel graphics unavailable, using the processor: "
+                                        f"{type(exc).__name__}: {exc}")[:300]
+            if self._request is not None:
+                self.available = True
+                return
+            self._open_processor()
+        except Exception as exc:
+            self._fail(exc)
+
+    def _open_graphics(self) -> None:
+        import sys
+        if OPENVINO_DIR.is_dir() and str(OPENVINO_DIR) not in sys.path:
+            sys.path.append(str(OPENVINO_DIR))      # after the tool's own packages, never shadowing them
+        import openvino as ov
+        core = ov.Core()
+        if "GPU" not in core.available_devices:
+            raise RuntimeError("no Intel graphics device")
+        cache = OPENVINO_DIR / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        core.set_property({"CACHE_DIR": str(cache)})
+        model = core.read_model(str(self.model_path))
+        shape = [int(value) for value in model.input(0).get_shape()]
+        expected = [1, 3, *self.input_size]
+        if shape != expected:
+            raise ValueError(f"Unsupported ML input shape: {shape}; expected {expected}")
+        compiled = core.compile_model(model, "GPU", {"PERFORMANCE_HINT": "LATENCY",
+                                                     "INFERENCE_PRECISION_HINT": self.gpu_precision})
+        request = compiled.create_infer_request()
+        request.infer({0: np.zeros(expected, np.float32)})   # a broken driver fails here, not mid-shift
+        self._request, self._output = request, compiled.output(0)
+        self.provider = "Intel graphics (OpenVINO)"
+        self.precision = self.gpu_precision
+
+    def _open_processor(self) -> None:
+        if True:
+            threads = self._threads
             import onnxruntime as ort
             options = ort.SessionOptions()
             options.intra_op_num_threads = max(1, min(4, int(threads)))
@@ -167,17 +250,19 @@ class ObjectDetector:
             if len(inputs) != 1 or inputs[0].type != "tensor(float)":
                 raise ValueError("Unsupported ML input type")
             shape = inputs[0].shape
-            if shape != [1, 3, 416, 416]:
-                raise ValueError(f"Unsupported ML input shape: {shape}")
+            expected = [1, 3, *self.input_size]
+            if shape != expected:
+                raise ValueError(f"Unsupported ML input shape: {shape}; expected {expected}")
             self._input_name = inputs[0].name
+            self.provider = "CPU"
+            self.precision = "f32"
             self.available = True
-        except Exception as exc:
-            self._fail(exc)
 
     def _fail(self, exc: Exception) -> None:
         self.available = False
         self.error = f"{type(exc).__name__}: {exc}"
         self._session = None
+        self.precision = None
 
     def detect(self, rgb_frame: np.ndarray) -> list[dict]:
         if not self.available:
@@ -185,9 +270,23 @@ class ObjectDetector:
         started = time.perf_counter()
         try:
             prepared, ratio = preprocess_rgb(rgb_frame, self.input_size)
-            output = self._session.run(None, {self._input_name: prepared})[0]
+            if self._request is not None:
+                try:
+                    output = self._request.infer({0: prepared})[self._output].copy()
+                except Exception as exc:                          # noqa: BLE001
+                    # Graphics trouble mid-shift: carry on with the processor at once.
+                    self._request = None
+                    if not self.allow_cpu_fallback:
+                        raise RuntimeError(f"Graphics inference failed; CPU fallback disabled: {exc}") from exc
+                    self.engine_note = (f"Intel graphics failed, switched to the processor: "
+                                        f"{type(exc).__name__}: {exc}")[:300]
+                    self._open_processor()
+                    output = self._session.run(None, {self._input_name: prepared})[0]
+            else:
+                output = self._session.run(None, {self._input_name: prepared})[0]
             detections = decode_detections(output, self.input_size, ratio,
-                                           rgb_frame.shape[:2], self.confidence, self.nms_iou)
+                                           rgb_frame.shape[:2], self.confidence, self.nms_iou,
+                                           normal_confidence=getattr(self, 'normal_confidence', None))
             self.inference_ms = round((time.perf_counter() - started) * 1000, 2)
             self.frames_processed += 1
             return detections
@@ -197,7 +296,9 @@ class ObjectDetector:
 
     def status(self) -> dict:
         return {"available": self.available, "error": self.error,
-                "model": "YOLOX-Tiny COCO pretrained", "provider": "CPU",
+                "model": self.model_label, "provider": self.provider,
+                "precision": self.precision,
+                "engine_note": self.engine_note,
                 "confidence_threshold": self.confidence,
                 "classes": list(TARGET_CLASSES.values()), "inference_ms": self.inference_ms,
                 "frames_processed": self.frames_processed,

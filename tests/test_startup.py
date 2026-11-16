@@ -60,7 +60,7 @@ class StartupTests(unittest.TestCase):
     def test_failed_bridge_prevents_watcher_launch(self):
         with patch.object(self.ctl, "bridge", return_value=
                           subprocess.CompletedProcess([], 1, "", "failed")):
-            self.assertEqual(self.ctl.cmd_start(argparse.Namespace(source="test")), 1)
+            self.assertEqual(self.ctl.cmd_start(argparse.Namespace(source=self.ctl.DEFAULT_SOURCE)), 1)
         self.ctl.ps.popen_detached.assert_not_called()
 
     def test_zero_exit_with_unhealthy_bridge_or_missing_relay_is_failure(self):
@@ -72,6 +72,44 @@ class StartupTests(unittest.TestCase):
                               subprocess.CompletedProcess([], 0, "", "")), \
                  patch.object(self.ctl, "bridge_status", return_value=state):
                 self.assertFalse(self.ctl.ensure_bridge())
+
+    def test_capture_source_never_starts_the_camera_bridge(self):
+        with patch.object(self.ctl, "bridge") as bridge,              patch.object(self.ctl, "watcher_state", side_effect=[None, {"armed": False}]),              patch.object(self.ctl.time, "sleep"):
+            self.ctl.ps.popen_detached.return_value = Mock(pid=4321, poll=Mock(return_value=None))
+            self.assertEqual(self.ctl.cmd_start(argparse.Namespace(source="usbcam:12ab:3456")), 0)
+        bridge.assert_not_called()
+        command = self.ctl.ps.popen_detached.call_args[0][0]
+        self.assertIn("usbcam:12ab:3456", command)
+
+    def test_configured_source_and_bridge_need(self):
+        self.assertEqual(self.ctl.configured_source(), self.ctl.DEFAULT_SOURCE
+                         if not self.ctl.SOURCE_FILE.is_file() else self.ctl.configured_source())
+        self.assertTrue(self.ctl.needs_bridge("rtsp://127.0.0.1:8554/c500"))
+        self.assertFalse(self.ctl.needs_bridge("usbcam:12ab:3456"))
+        self.assertFalse(self.ctl.needs_bridge("rtsp://192.0.2.5:554/Streaming/Channels/101"))
+        with tempfile.TemporaryDirectory() as folder:
+            source_file = Path(folder) / "source.json"
+            with patch.object(self.ctl, "SOURCE_FILE", source_file):
+                self.assertEqual(self.ctl.configured_source(), self.ctl.DEFAULT_SOURCE)
+                source_file.write_text('{"source": "usbcam:12ab:3456"}', encoding="utf-8")
+                self.assertEqual(self.ctl.configured_source(), "usbcam:12ab:3456")
+                source_file.write_text('not json', encoding="utf-8")
+                self.assertEqual(self.ctl.configured_source(), self.ctl.DEFAULT_SOURCE)
+
+    def test_supervisor_with_capture_source_does_not_touch_the_bridge(self):
+        with patch.object(self.ctl, "configured_source", return_value="usbcam:12ab:3456"),              patch.object(self.ctl, "watcher_state", return_value={"armed": True, "loop_age_s": .1}),              patch.object(self.ctl, "ensure_bridge") as bridge,              patch.object(self.service.time, "sleep", side_effect=StopLoop):
+            with self.assertRaises(StopLoop):
+                self.service.supervise()
+        bridge.assert_not_called()
+
+    def test_refresh_request_starts_a_fresh_watcher_after_the_old_one_closes(self):
+        (self.ctl.STATE / "restart-request").write_text("now")
+        with patch.object(self.ctl, "watcher_state", side_effect=[{"armed": True}, None]),              patch.object(self.ctl, "cmd_start", return_value=0) as start,              patch.object(self.service.time, "sleep"):
+            self.assertTrue(self.service.restart_requested())
+            status = self.service.finish_refresh(wait_s=5)
+        start.assert_called_once()
+        self.assertIn("Refreshed", status)
+        self.assertFalse(self.service.restart_requested())
 
     def test_supervisor_honours_saved_stop(self):
         self.ctl.PAUSED.write_text("paused")
@@ -89,7 +127,7 @@ class StartupTests(unittest.TestCase):
             return True
         with patch.object(self.ctl, "ensure_bridge", side_effect=stop_during_start):
             self.assertEqual(self.ctl.cmd_start(
-                argparse.Namespace(source="test", resume=False)), 0)
+                argparse.Namespace(source=self.ctl.DEFAULT_SOURCE, resume=False)), 0)
         self.assertTrue(self.ctl.PAUSED.exists())
         self.ctl.ps.popen_detached.assert_not_called()
 

@@ -54,6 +54,7 @@ class AlignmentIntegrationTests(unittest.TestCase):
 
     def test_rejection_longer_than_hold_pauses_scene_alerts_and_faults(self):
         aligner = mock.Mock()
+        aligner.reference = None        # no moved-camera search with a fake aligner (hold can exceed 20 s)
         aligner.update.side_effect = [self.accepted()] + [(None, {'reason': 'Scene changed', 'reference_ready': True})] * 3
         aligner.warp.return_value = self.frame
         self.obj.aligner = aligner
@@ -161,7 +162,7 @@ class AlignmentIntegrationTests(unittest.TestCase):
         from test_scene_alignment import textured_scene
         night = textured_scene(seed=4242)
         main = mock.Mock()
-        main.update.return_value = (None, {'reason': 'Too few unambiguous mutual landmark matches',
+        main.update.return_value = (night, {'translation_px': [0.,0.], 'current_to_reference': [[1.,0.,0.],[0.,1.,0.]],
                                            'reference_ready': True})
         main.warp.return_value = night
         self.obj.aligner = main
@@ -169,16 +170,17 @@ class AlignmentIntegrationTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.obj.request_lighting_reference()
         self.obj.armed = False
+        self.obj.alignment = {'state': 'tracking'}
         self.obj._alignment_pose = watch.np.array([[1., 0., 0.], [0., 1., 0.]])
         with tempfile.TemporaryDirectory() as folder, \
                 mock.patch.object(self.obj, '_extra_path', return_value=Path(folder) / 'lighting.npz'):
             self.obj.request_lighting_reference()
-            self.assertIsNone(self.obj.align_frame(night))   # Capture frame; still unverified.
+            self.assertIsNotNone(self.obj.align_frame(night))
             with self.assertRaises(ValueError):              # One check at a time.
                 self.obj.request_lighting_reference()
             for _ in range(5):
                 self.obj.align_frame(night)
-            self.assertEqual(main.warp.call_args_list[0].args[1].tolist(), [[1., 0., 0.], [0., 1., 0.]])
+            main.warp.assert_not_called()
             self.assertEqual(len(self.obj._extra_aligners), 1)
             self.assertIn('Saved a lighting reference', self.obj._lighting_status)
             self.assertIsNotNone(self.obj.align_frame(night))
@@ -191,10 +193,137 @@ class AlignmentIntegrationTests(unittest.TestCase):
         main.warp.return_value = self.frame   # Blank frame: no landmarks to learn.
         self.obj.aligner = main
         self.obj.armed, self.obj.first_frame_seen, self.obj.last_frame_at = False, True, time.monotonic()
-        self.obj.request_lighting_reference()
+        with self.assertRaisesRegex(ValueError, 'verified alignment'):
+            self.obj.request_lighting_reference()
+        # A request accepted just before the view moved is checked again at capture.
+        self.obj._pending_lighting = True
         self.obj.align_frame(self.frame)
         self.assertIsNone(self.obj._learning)
-        self.assertIn('nothing was saved', self.obj._lighting_status)
+        self.assertIn('no lighting reference was saved', self.obj._lighting_status)
+
+    def test_lighting_save_failure_restores_previous_references(self):
+        prior, candidate = mock.Mock(), mock.Mock()
+        self.obj._extra_aligners, self.obj._extra_used, self.obj._preferred_aligner = [prior], [1.], 1
+        with mock.patch.object(self.obj, '_save_lighting_references', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                self.obj._commit_lighting_reference(candidate, 2.)
+        self.assertEqual(self.obj._extra_aligners, [prior])
+        self.assertEqual(self.obj._extra_used, [1.])
+        self.assertEqual(self.obj._preferred_aligner, 1)
+
+    def test_moved_camera_is_re_registered_and_zones_keep_working(self):
+        import cv2
+        from scene_alignment import SceneAligner, build_feature_mask
+        from test_scene_alignment import textured_scene
+        scene = textured_scene(seed=77)
+        height, width = scene.shape[:2]
+        self.obj.aligner = SceneAligner(scene, build_feature_mask(scene.shape, border_px=15))
+        self.obj._alignment_reference = scene
+        self.obj._alignment_blocked = True
+        moved = cv2.warpPerspective(scene, cv2.getPerspectiveTransform(
+            watch.np.float32([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]]),
+            watch.np.float32([[35, 20], [width - 30, 45], [width - 55, height - 15], [15, height - 35]])),
+            (width, height))
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(self.obj, '_reacquire_path', return_value=Path(folder) / 'r.json'):
+            self.assertIsNone(self.obj.align_frame(moved), 'the moved view must not align yet')
+            self.obj._alignment_bad_since = time.monotonic() - 60   # lost for a while
+            self.obj._last_reacquire_try = 0.
+            self.obj.align_frame(moved)                            # triggers re-registration
+            self.assertIsNotNone(self.obj._reacquire, self.obj.alignment.get('reacquire'))
+            self.assertTrue((Path(folder) / 'r.json').is_file())
+            aligned = self.obj.align_frame(moved)
+        self.assertIsNotNone(aligned)
+        self.assertEqual(self.obj.alignment['state'], 'tracking')
+        self.assertTrue(self.obj.alignment['reacquired'])
+        self.assertGreater(self.obj.alignment['reacquire']['moved_px'], 5)
+
+    def test_a_strange_view_is_not_re_registered(self):
+        from scene_alignment import SceneAligner, build_feature_mask
+        from test_scene_alignment import textured_scene
+        scene = textured_scene(seed=77)
+        self.obj.aligner = SceneAligner(scene, build_feature_mask(scene.shape, border_px=15))
+        self.obj._alignment_reference = scene
+        self.obj._alignment_blocked = True
+        self.obj._alignment_bad_since = time.monotonic() - 60
+        self.obj._last_reacquire_try = 0.
+        self.assertIsNone(self.obj.align_frame(textured_scene(seed=404)))
+        self.assertIsNone(self.obj._reacquire)
+        self.assertTrue(self.obj.alignment['reacquire'].get('reason'))
+
+    def test_inverse_affine_cannot_restore_pixels_cropped_by_remount(self):
+        self.obj.zones = [watch.Zone(name='Right edge', rect=(.87, .4, .05, .1))]
+        self.obj._reacquire = watch.np.array([[1., 0., 100.], [0., 1., 0.], [0., 0., 1.]])
+        self.assertFalse(self.obj._reacquired_zones_visible(
+            self.frame, [[1., 0., -100.], [0., 1., 0.]]),
+            'The second warp cannot recover source pixels discarded by the first')
+
+    def test_accepted_affine_cannot_hide_an_unseen_remounted_alarm_zone(self):
+        self.obj.zones = [watch.Zone(name='Left edge', rect=(.1, .4, .05, .1))]
+        self.obj._reacquire = watch.np.array([[1., 0., 150.], [0., 1., 0.], [0., 0., 1.]])
+        self.obj._last_reacquire_try = time.monotonic()
+        aligner = mock.Mock()
+        aligner.update.return_value = self.accepted()
+        aligner.warp.return_value = self.frame
+        self.obj.aligner = aligner
+        self.obj._alignment_blocked = False
+        self.obj._alignment_used = ([[1., 0., 0.], [0., 1., 0.]], time.monotonic())
+        self.assertIsNone(self.obj.align_frame(self.frame))
+        self.assertTrue(self.obj._alignment_blocked)
+        self.assertEqual(self.obj.alignment['state'], 'calibration_required')
+        self.assertIn('outside', self.obj.alignment['reason'])
+        aligner.warp.assert_not_called()
+
+    def test_calibration_preserves_remount_and_next_raw_frame_alignment(self):
+        import cv2
+        import screen_registration
+        from scene_alignment import SceneAligner, build_feature_mask
+        from test_scene_alignment import textured_scene
+        reference = textured_scene(seed=77)
+        height, width = reference.shape[:2]
+        forward = cv2.getPerspectiveTransform(
+            watch.np.float32([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]]),
+            watch.np.float32([[35, 20], [width - 30, 45], [width - 55, height - 15], [15, height - 35]]))
+        raw = cv2.warpPerspective(reference, forward, (width, height))
+        self.obj.zones = [watch.Zone(name='Center', rect=(.35, .35, .1, .1))]
+        self.obj.alignment_config = {'enabled': True, 'include_rects': [[0, 0, 1, 1]], 'border_px': 15}
+        self.obj.aligner = SceneAligner(reference, self.obj._feature_mask(reference),
+                                        required_mask=self.obj._required_mask(reference))
+        self.obj._alignment_reference = reference.copy()
+        self.obj._reacquire = watch.np.linalg.inv(forward)
+        original_remount = self.obj._reacquire.copy()
+        self.obj.armed = False
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(self.obj, '_alignment_path', return_value=Path(folder) / 'reference.npz'):
+            self.obj._save_reacquire()
+            before = self.obj.align_frame(raw)
+            self.assertIsNotNone(before, self.obj.alignment)
+            self.obj._pending_calibration = True
+            self.assertIsNotNone(self.obj.align_frame(raw), self.obj.alignment)
+            self.assertEqual(self.obj._calibration_error, '')
+            watch.np.testing.assert_allclose(self.obj._reacquire, original_remount)
+            self.assertTrue(self.obj._reacquire_path().is_file())
+            self.assertTrue(self.obj._alignment_path().is_file())
+            after = self.obj.align_frame(raw)
+            self.assertIsNotNone(after, self.obj.alignment)
+            self.assertEqual(self.obj.alignment['state'], 'tracking')
+            monitored = self.obj._required_mask(raw) != 0
+            self.assertLess(float(watch.np.abs(before.astype(float) - after)[monitored].mean()), 3.)
+
+    def test_unverified_remount_cannot_certify_itself_during_calibration(self):
+        self.obj.armed = False
+        self.obj._pending_calibration = True
+        self.obj._reacquire = watch.np.eye(3)
+        self.obj._last_reacquire_try = time.monotonic()
+        self.obj.aligner = mock.Mock()
+        self.obj.aligner.update.return_value = (None, {'reason': 'Scene changed', 'reference_ready': True})
+        previous = self.obj.aligner
+        with mock.patch('zone_editor._atomic_write') as save:
+            self.assertIsNone(self.obj.align_frame(self.frame))
+        save.assert_not_called()
+        self.assertIs(self.obj.aligner, previous)
+        watch.np.testing.assert_array_equal(self.obj._reacquire, watch.np.eye(3))
+        self.assertIn('Verify the recovered camera position', self.obj._calibration_error)
 
     def test_arming_waits_for_reference_operation(self):
         entered, release, armed = threading.Event(),threading.Event(),threading.Event()
@@ -224,7 +353,7 @@ class AlignmentIntegrationTests(unittest.TestCase):
 
     def test_alignment_fault_does_not_repeat_after_ack_and_recovers(self):
         now=time.monotonic();self.obj.first_frame_seen=True;self.obj.last_frame_at=now
-        self.obj._alignment_blocked=True;self.obj._alignment_bad_since=now-3
+        self.obj._alignment_blocked=True;self.obj._alignment_bad_since=now-3;self.obj._alignment_used=([[1.,0.,0.],[0.,1.,0.]],now-10)
         self.obj.check_health(now)
         self.assertEqual(self.obj.alarm,'fault')
         self.obj.acknowledge();self.obj.check_health(now+.05)

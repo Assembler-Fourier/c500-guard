@@ -51,6 +51,7 @@ ASSETS = {
 }
 
 STATE = ps.state_dir()
+POWER_OFF = STATE / "power-off"
 BIN_DIR = STATE / "bin"
 CONFIG = STATE / "go2rtc.yaml"
 LOGIN = STATE / "bridge-login.json"
@@ -280,7 +281,7 @@ def start_shim() -> None:
     Written by `add-stream --lan-shim`. Absent on cameras that answer a plain
     unicast search, in which case nothing here runs at all.
     """
-    if not CAMERA.exists():
+    if POWER_OFF.exists() or not CAMERA.exists():
         return
     if shim_pid():
         return
@@ -291,11 +292,16 @@ def start_shim() -> None:
         return
     script = Path(__file__).resolve().parent / "lan_shim.py"
     ps.rotate_log(SHIM_LOG)
+    if POWER_OFF.exists():
+        return
     with SHIM_LOG.open("ab") as handle:
         child = ps.popen_detached(
             [sys.executable, str(script), "--camera", camera], handle)
     SHIM_PID.write_text(str(child.pid) + chr(10))
     ps.harden(SHIM_PID)
+    if POWER_OFF.exists():
+        stop_shim()
+        return
     time.sleep(0.5)
     if child.poll() is not None:
         raise SystemExit(f"LAN relay exited immediately. See {SHIM_LOG}")
@@ -316,6 +322,9 @@ def stop_shim() -> None:
 
 
 def start() -> None:
+    if POWER_OFF.exists():
+        print("The whole program is OFF. Open the BarrierWatcher app (desktop or Start menu) to start it.")
+        return
     init()
     repair_config()
     if running_pid():
@@ -338,20 +347,30 @@ def start() -> None:
         return status()
     if not binary_path().is_file():
         fetch()
+    if POWER_OFF.exists():
+        return
     if not wait_for_ports():
         raise SystemExit("Ports 1984/8554 still busy after 90s. Something else is using them.")
+    if POWER_OFF.exists():
+        return
     ps.rotate_log(LOG)
     with LOG.open("ab") as handle:
         child = ps.popen_detached([str(binary_path()), "-config", str(CONFIG)], handle)
     PID_FILE.write_text(str(child.pid) + "\n")
     ps.harden(PID_FILE)
     for _ in range(100):
+        if POWER_OFF.exists():
+            stop()
+            return
         if child.poll() is not None:
             raise SystemExit(f"go2rtc exited immediately. See {LOG}")
         try:
             request("/api/xiaomi")
             print("Bridge started (loopback only).")
             start_shim()
+            if POWER_OFF.exists():
+                stop()
+                return
             return status()
         except (OSError, urllib.error.URLError):
             time.sleep(0.2)

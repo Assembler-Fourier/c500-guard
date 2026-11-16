@@ -15,9 +15,20 @@ from pathlib import Path
 import tempfile
 import uuid
 
+from region_geometry import validate_polygon
+
 
 FIELDS = {"name", "rect", "motion", "light", "severity", "light_severity",
-          "motion_pct", "light_delta", "on_frames", "off_frames"}
+          "motion_pct", "light_delta", "on_frames", "off_frames", "polygon",
+          "exclude_polygons", "classes", "trigger", "priority", "route_group",
+          "ai_confirm_observations", "ai_confirmation_window_s", "ai_fast_confirm_confidence", "ai_confidence", "arrival_direction",
+          "arrival_min_progress", "stationary_confirm_s", "confirmation_polygon",
+          "route_role", "operator_hint", "alert_stage", "light_polygon",
+          "strict_change", "change_threshold", "connected_pct",
+          "taillight_red_pct", "taillight_change_pct", "taillight_wake_pct", "bottom_edge_entry",
+          "ai_confidence_moving", "approach_motion", "ai_context"}
+
+ALLOWED_CLASSES = {"person", "bicycle", "car", "motorcycle", "bus", "truck"}
 
 
 def _number(value, label: str, low: float, high: float, *, positive=False):
@@ -56,13 +67,99 @@ def validate_config(payload: dict, original: dict | None = None) -> dict:
         if width <= 0 or height <= 0 or x + width > 1 + 1e-9 or y + height > 1 + 1e-9:
             raise ValueError(f"{label} rectangle must have positive dimensions and stay inside the image.")
         zone["rect"] = [x, y, width, height]
-        for field in ("motion", "light"):
+        if "polygon" in zone:
+            zone["polygon"] = validate_polygon(zone["polygon"], f"{label} outline")
+            if any(px < x - 1e-9 or py < y - 1e-9 or
+                   px > x + width + 1e-9 or py > y + height + 1e-9
+                   for px, py in zone["polygon"]):
+                raise ValueError(f"{label} outline must stay inside its rectangle.")
+        if "exclude_polygons" in zone:
+            exclusions = zone["exclude_polygons"]
+            if not isinstance(exclusions, list) or len(exclusions) > 16:
+                raise ValueError(f"{label} can contain up to 16 ignored areas.")
+            zone["exclude_polygons"] = [
+                validate_polygon(points, f"{label} ignored area {index + 1}")
+                for index, points in enumerate(exclusions)]
+        if zone.get("confirmation_polygon") is not None:
+            zone["confirmation_polygon"] = validate_polygon(
+                zone["confirmation_polygon"], f"{label} audible confirmation area")
+            if any(px < x - 1e-9 or py < y - 1e-9 or
+                   px > x + width + 1e-9 or py > y + height + 1e-9
+                   for px, py in zone["confirmation_polygon"]):
+                raise ValueError(f"{label} confirmation area must stay inside its rectangle.")
+        if zone.get("light_polygon") is not None:
+            zone["light_polygon"] = validate_polygon(zone["light_polygon"], f"{label} light area")
+            if any(px < x - 1e-9 or py < y - 1e-9 or
+                   px > x + width + 1e-9 or py > y + height + 1e-9
+                   for px, py in zone["light_polygon"]):
+                raise ValueError(f"{label} light area must stay inside its rectangle.")
+        if "route_role" in zone and zone["route_role"] not in ("", "exit", "entrance", "pedestrian"):
+            raise ValueError(f"{label} route role must be exit, entrance, or pedestrian.")
+        if "alert_stage" in zone and zone["alert_stage"] not in ("", "advance", "barrier"):
+            raise ValueError(f"{label} alert stage must be advance or barrier.")
+        if "operator_hint" in zone and (not isinstance(zone["operator_hint"], str)
+                or len(zone["operator_hint"]) > 240):
+            raise ValueError(f"{label} operator hint must be text of at most 240 characters.")
+        if "trigger" in zone and zone["trigger"] not in ("ai", "ai_light", "motion", "hybrid", "taillight"):
+            raise ValueError(f"{label} alert source must be ai, ai_light, motion, hybrid, or taillight.")
+        for field, low, high in (("taillight_red_pct", .1, 50), ("taillight_change_pct", 1, 100),
+                                 ("taillight_wake_pct", .5, 100), ("ai_confidence_moving", .05, .95)):
+            if field in zone and zone[field] is not None:
+                _number(zone[field], f"{label} {field}", low, high)
+        if "bottom_edge_entry" in zone and not isinstance(zone["bottom_edge_entry"], bool):
+            raise ValueError(f"{label} bottom_edge_entry must be true or false.")
+        if "priority" in zone and not isinstance(zone["priority"], bool):
+            raise ValueError(f"{label} priority must be true or false.")
+        if "ai_context" in zone and not isinstance(zone["ai_context"], bool):
+            raise ValueError(f"{label} AI context must be true or false.")
+        if "route_group" in zone and (not isinstance(zone["route_group"], str) or len(zone["route_group"]) > 80):
+            raise ValueError(f"{label} route group must be text of at most 80 characters.")
+        if "ai_confirm_observations" in zone and (type(zone["ai_confirm_observations"]) is not int
+                or not 2 <= zone["ai_confirm_observations"] <= 8):
+            raise ValueError(f"{label} AI confirmation must be an integer from 2 to 8.")
+        for field, low, high in (("ai_confidence", 0, 1), ("ai_confirmation_window_s", 0, 1.5), ("arrival_min_progress", .001, .5),
+                                 ("stationary_confirm_s", 0, 30)):
+            if field in zone:
+                _number(zone[field], f"{label} {field}", low, high)
+        if "ai_fast_confirm_confidence" in zone:
+            fast = _number(zone["ai_fast_confirm_confidence"], f"{label} strong confirmation", 0, 1)
+            if fast and (fast < .60 or fast < zone.get("ai_confidence", 0)
+                         or zone.get("alert_stage") != "barrier" or not zone.get("confirmation_polygon")
+                         or zone.get("ai_confirm_observations", 2) < 3):
+                raise ValueError(f"{label} strong confirmation requires a barrier core, three ordinary observations and a confidence of at least .60 and the ordinary floor.")
+        direction = zone.get("arrival_direction")
+        if "approach_motion" in zone and not isinstance(zone['approach_motion'], bool):
+            raise ValueError(f"{label} approach motion must be true or false.")
+        if zone.get('approach_motion') and (zone.get('alert_stage') != 'advance'
+                or zone.get('route_role') != 'entrance' or not zone.get('route_group')
+                or zone.get('trigger') != 'ai' or not zone.get('polygon') or direction is None):
+            raise ValueError(f"{label} approach motion requires an entrance advance AI region with a direction.")
+        if direction is not None:
+            if not isinstance(direction, (list, tuple)) or len(direction) != 2:
+                raise ValueError(f"{label} arrival direction must contain dx and dy.")
+            for value in direction:
+                _number(value, f"{label} arrival direction", -1, 1)
+            if math.hypot(*direction) < .01:
+                raise ValueError(f"{label} arrival direction must not be zero.")
+        if "classes" in zone:
+            classes = zone["classes"]
+            if (not isinstance(classes, list) or len(classes) > len(ALLOWED_CLASSES)
+                    or any(not isinstance(value, str) or value not in ALLOWED_CLASSES
+                           for value in classes) or len(classes) != len(set(classes))):
+                raise ValueError(f"{label} object types must be unique supported labels.")
+            if not classes and zone.get("trigger", "hybrid") not in ("motion", "taillight"):
+                raise ValueError(f"{label} needs at least one object type for AI alerts.")
+        for field in ("motion", "light", "strict_change"):
             if field in zone and not isinstance(zone[field], bool):
                 raise ValueError(f"{label} {field} must be true or false.")
         for field in ("severity", "light_severity"):
             if field in zone and zone[field] not in ("early", "main", "fault"):
                 raise ValueError(f"{label} {field} must be early, main, or fault.")
-        for field, maximum in (("motion_pct", 100), ("light_delta", 255)):
+        if zone.get("strict_change") and (zone.get("trigger") != "motion" or not zone.get("motion", True)
+                                          or zone.get("on_frames", 2) != 1):
+            raise ValueError(f"{label} strict change requires a one-frame motion alarm.")
+        for field, maximum in (("motion_pct", 100), ("light_delta", 255), ("change_threshold", 255),
+                               ("connected_pct", 100)):
             if field in zone:
                 _number(zone[field], f"{label} {field}", 0, maximum, positive=True)
         for field in ("on_frames", "off_frames"):
@@ -108,50 +205,6 @@ def save_config(path: Path, payload: dict, *, armed: bool) -> dict:
 
 
 def render_page(path: Path) -> str:
-    config = json.dumps(read_config(path), ensure_ascii=False, allow_nan=False)
-    # A label containing </script> must remain inert JSON, never HTML markup.
-    return PAGE.replace("__ZONE_CONFIG__", config.replace("<", "\\u003c"))
-
-
-PAGE = r'''<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>c500-guard · Edit zones</title>
-<style>
-:root{color-scheme:dark;font:15px system-ui,sans-serif;background:#10151b;color:#e7edf4}*{box-sizing:border-box}body{margin:0;padding:24px;max-width:1280px;margin:auto}a{color:#9bc9ff}h1{font-size:28px;margin:16px 0 6px}p{color:#b9c6d6;line-height:1.5}.layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:22px;margin-top:20px}.preview{position:relative;align-self:start;border:1px solid #445064;background:#000;line-height:0}.preview img{width:100%;height:auto;display:block;min-height:180px}.preview canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}.panel{background:#1b2430;border-radius:10px;padding:18px}label{display:block;margin:14px 0 5px;font-weight:600}input,select,button{font:inherit;border:1px solid #526073;border-radius:6px;padding:9px;background:#121a24;color:inherit}input:not([type=checkbox]),select{width:100%}input[type=checkbox]{margin-right:8px}button{cursor:pointer}button:disabled{opacity:.45;cursor:default}.buttons{display:flex;gap:8px;margin:12px 0}#save{background:#a8d5ff;color:#0d2032;font-weight:700;width:100%;margin-top:15px}#status,#message{padding:10px 0;line-height:1.4}#message{color:#a8d5ff;white-space:pre-wrap}.small{font-size:13px;color:#bac7d6}.coords{font:12px ui-monospace,monospace;line-height:1.6;overflow-wrap:anywhere}@media(max-width:850px){body{padding:16px}.layout{grid-template-columns:1fr}.panel{max-width:none}}
-</style></head><body><a href="/">← Dashboard</a><h1>Edit detection zones</h1>
-<p>Reposition the camera, then choose a zone and drag a rectangle over the live image. Keep clocks, screen edges and unrelated displays outside your zones.</p>
-<div id="status" role="status">Checking watcher state…</div><div class="layout"><div>
-<div class="preview"><img id="frame" alt="Live camera preview"><canvas id="overlay" aria-label="Drag to draw the selected zone"></canvas></div>
-<p class="small">Drag to replace the selected rectangle. Blue and gold rectangles show your edits; outlines already in the camera preview show the saved zones. Use x, y, width and height below for precise placement. Saving resets zone detection history; the watcher stays disarmed.</p></div>
-<section class="panel" aria-label="Zone settings"><label for="zone">Selected zone</label><select id="zone"></select><div class="buttons"><button id="add">Add zone</button><button id="remove">Remove</button></div>
-<label for="name">Label</label><input id="name" maxlength="80">
-<label><input id="motion" type="checkbox">Detect motion</label><label for="motion_pct">Changed pixels (%)</label><input id="motion_pct" type="number" min="0.01" max="100" step="0.1">
-<label><input id="light" type="checkbox">Detect light changes</label><label for="light_delta">Light change threshold (1–255)</label><input id="light_delta" type="number" min="0.01" max="255" step="1">
-<label for="rect">Rectangle: x, y, width, height</label><input id="rect" class="coords" aria-describedby="rect-help"><p id="rect-help" class="small">Normalized coordinates from 0 to 1.</p>
-<button id="save" disabled>Save zones</button><div id="message" role="status"></div></section></div>
-<script id="initial-config" type="application/json">__ZONE_CONFIG__</script>
-<script>
-'use strict';
-const config=JSON.parse(document.getElementById('initial-config').textContent),zones=config.zones;
-const $=id=>document.getElementById(id),canvas=$('overlay'),ctx=canvas.getContext('2d');
-let selected=0,armed=true,dirty=false,drag=null,frameReady=false;
-function message(text){$('message').textContent=text}
-function list(){const picker=$('zone');picker.replaceChildren();zones.forEach((z,i)=>{const o=document.createElement('option');o.value=i;o.textContent=z.name;picker.appendChild(o)});picker.value=selected;$('remove').disabled=zones.length<=1;$('add').disabled=zones.length>=32}
-function fields(){const z=zones[selected];$('name').value=z.name;$('motion').checked=z.motion??true;$('light').checked=z.light??false;$('motion_pct').value=z.motion_pct??1.2;$('light_delta').value=z.light_delta??10;$('rect').value=z.rect.map(v=>Number(v.toFixed(5))).join(', ');draw()}
-function draw(){const box=canvas.getBoundingClientRect();canvas.width=Math.max(1,Math.round(box.width));canvas.height=Math.max(1,Math.round(box.height));ctx.clearRect(0,0,canvas.width,canvas.height);zones.forEach((z,i)=>{let [x,y,w,h]=z.rect;const active=i===selected;ctx.strokeStyle=active?'#a8e8ff':'#ffcf75';ctx.fillStyle=active?'#a8e8ff25':'#ffcf7510';ctx.lineWidth=active?3:1.5;ctx.fillRect(x*canvas.width,y*canvas.height,w*canvas.width,h*canvas.height);ctx.strokeRect(x*canvas.width,y*canvas.height,w*canvas.width,h*canvas.height);ctx.font='bold 13px system-ui';ctx.fillStyle=active?'#d6f6ff':'#ffdf9b';ctx.shadowColor='#000';ctx.shadowBlur=4;ctx.fillText(z.name,x*canvas.width+5,Math.max(16,y*canvas.height+17));ctx.shadowBlur=0})}
-function changed(){dirty=true;message('Unsaved changes.');draw()}
-function commit(){const z=zones[selected],name=$('name').value.trim(),rect=$('rect').value.split(',').map(s=>Number(s.trim()));if(!name)throw Error('Enter a zone label.');if(rect.length!==4||rect.some(v=>!Number.isFinite(v)||v<0||v>1)||rect[2]<=0||rect[3]<=0||rect[0]+rect[2]>1.000000001||rect[1]+rect[3]>1.000000001)throw Error('Rectangle must fit within the image and have positive width and height.');const motion=Number($('motion_pct').value),light=Number($('light_delta').value);if(!(motion>0&&motion<=100&&light>0&&light<=255))throw Error('Check the motion and light thresholds.');Object.assign(z,{name,rect,motion:$('motion').checked,light:$('light').checked,motion_pct:motion,light_delta:light});list()}
-for(const id of ['name','motion','light','motion_pct','light_delta','rect'])$(id).addEventListener('change',()=>{try{commit();changed()}catch(e){message(e.message)}});
-$('zone').onchange=()=>{const next=Number($('zone').value);try{commit();selected=next;list();fields()}catch(e){$('zone').value=selected;message(e.message)}};
-$('add').onclick=()=>{try{commit();let n=zones.length+1;while(zones.some(z=>z.name===`Zone ${n}`))n++;zones.push({name:`Zone ${n}`,rect:[.25,.25,.25,.25],motion:true,light:false,severity:'main',light_severity:'early',motion_pct:1.2,light_delta:10,on_frames:2,off_frames:8});selected=zones.length-1;list();fields();changed()}catch(e){message(e.message)}};
-$('remove').onclick=()=>{if(zones.length>1){zones.splice(selected,1);selected=Math.min(selected,zones.length-1);list();fields();changed()}};
-function point(e){const r=canvas.getBoundingClientRect();return [Math.max(0,Math.min(1,(e.clientX-r.left)/r.width)),Math.max(0,Math.min(1,(e.clientY-r.top)/r.height))]}
-canvas.onpointerdown=e=>{if(!frameReady)return;try{commit()}catch(err){message(err.message);return}drag={start:point(e),old:[...zones[selected].rect]};canvas.setPointerCapture(e.pointerId)};
-canvas.onpointermove=e=>{if(!drag)return;const [x,y]=point(e),[a,b]=drag.start;zones[selected].rect=[Math.min(a,x),Math.min(b,y),Math.abs(x-a),Math.abs(y-b)].map(v=>Number(v.toFixed(6)));$('rect').value=zones[selected].rect.join(', ');draw()};
-function endDrag(){if(!drag)return;if(zones[selected].rect[2]<.002||zones[selected].rect[3]<.002)zones[selected].rect=drag.old;drag=null;fields();changed()}
-canvas.onpointerup=endDrag;canvas.onpointercancel=endDrag;window.addEventListener('resize',draw);
-async function state(){try{const r=await fetch('/state',{cache:'no-store'});if(!r.ok)throw Error();const s=await r.json();armed=s.armed!==false;$('status').textContent=armed?'Watcher is armed. Disarm it on the dashboard before saving.':'Watcher is disarmed. Zone changes can be saved.';$('save').disabled=armed}catch{armed=true;$('save').disabled=true;$('status').textContent='Watcher is unavailable. Saving is disabled.'}setTimeout(state,1500)}
-$('frame').onload=()=>{frameReady=true;draw();setTimeout(nextFrame,1000)};$('frame').onerror=()=>{frameReady=false;setTimeout(nextFrame,2000)};function nextFrame(){$('frame').src='/frame.jpg?t='+Date.now()}
-$('save').onclick=async()=>{try{commit();if(armed)throw Error('Disarm the watcher before saving.');$('save').disabled=true;const r=await fetch('/zones',{method:'POST',headers:{'Content-Type':'application/json','X-Via':'zone-editor'},body:JSON.stringify({zones})});const result=await r.json();if(!r.ok||!result.ok)throw Error(result.error||'Could not save zones.');dirty=false;message('Zones saved. Previous configuration backed up. Watcher remains disarmed.')}catch(e){message(e.message)}finally{$('save').disabled=armed}};
-window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue=''}});list();fields();state();nextFrame();
-</script></body></html>'''
+    """Use the same editor for direct rendering and the live dashboard route."""
+    from dashboard_ui import zone_editor_page
+    return zone_editor_page(read_config(path))

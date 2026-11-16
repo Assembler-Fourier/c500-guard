@@ -1,6 +1,7 @@
 """Synthetic detector/stream checks. No camera connection or real audio/state."""
 import importlib.util
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -34,9 +35,11 @@ class FakeBuzzer:
         self.set(None)
 
 
-def watcher():
+def watcher(zones_path=None):
+    # Generic/legacy image fixtures use the ANPR coordinate system. Live PTZ
+    # scenarios pass their own profile instead of changing every old fixture.
     args = types.SimpleNamespace(
-        source="rtsp://example.invalid/video", fps=8., zones=str(ROOT / "config" / "zones.json"),
+        source="rtsp://example.invalid/video", fps=8., zones=str(zones_path or ROOT / "config" / "views" / "anpr" / "zones.json"),
         silent=True, connect_grace=.3, lost_after=.2, freeze_after=20., black_after=5.,
         warmup=4., pixel_threshold=22., adapt=.02,
     )
@@ -46,6 +49,10 @@ def watcher():
          mock.patch.object(watch.Watcher, "_load_armed", return_value=True):
         obj = watch.Watcher(args)
     obj.log_event = mock.Mock()
+    # Sound tuning is module state: the site config (10% start, gentle climb)
+    # must not leak into tests written for the built-in defaults.
+    import alarm_audio
+    alarm_audio.reset_configuration()
     return obj
 
 
@@ -103,10 +110,10 @@ class WatcherTests(unittest.TestCase):
         release = threading.Event()
         original = obj._raise_alarm_locked
 
-        def paused(*args):
+        def paused(*args, **kwargs):
             entered.set()
             self.assertTrue(release.wait(2))
-            original(*args)
+            original(*args, **kwargs)
 
         with mock.patch.object(obj, "_raise_alarm_locked", side_effect=paused):
             raise_thread = threading.Thread(target=obj.raise_alarm, args=("main", "test"))
@@ -123,7 +130,7 @@ class WatcherTests(unittest.TestCase):
         self.assertIsNone(obj.alarm)
         self.assertIsNone(obj.buzzer.want)
 
-    def test_fault_ack_stays_silent_for_five_seconds_then_rechecks(self):
+    def test_same_fault_stays_acknowledged_beyond_quiet_deadline(self):
         obj = watcher()
         obj.first_frame_seen = True
         obj.last_frame_at = 1.
@@ -131,14 +138,71 @@ class WatcherTests(unittest.TestCase):
             obj.check_health(3.)
             self.assertEqual(obj.alarm, "fault")
             obj.acknowledge()
-            clock.return_value = 7.99
-            obj.check_health(7.99)
-            self.assertIsNone(obj.alarm)
-            self.assertIsNone(obj.buzzer.want)
-            self.assertTrue(obj.fault_reason)
+            for instant in (7.99, 13., 60.):
+                clock.return_value = instant
+                obj.check_health(instant)
+                self.assertIsNone(obj.alarm)
+                self.assertIsNone(obj.buzzer.want)
+                self.assertTrue(obj.fault_reason)
+
+    def test_recovered_fault_can_alarm_again_in_a_new_episode(self):
+        obj = watcher()
+        obj.zones = []
+        obj.first_frame_seen = True
+        obj.last_frame_at = 1.
+        with mock.patch.object(watch.time, 'monotonic', return_value=3.) as clock:
+            obj.check_health(3.)
+            old_id = obj.alarm_id
+            obj.acknowledge()
             clock.return_value = 8.
+            obj.last_frame_at = 8.
             obj.check_health(8.)
-            self.assertEqual(obj.alarm, "fault")
+            self.assertEqual(obj.fault_reason, '')
+            self.assertIsNone(obj._fault_kind)
+            clock.return_value = 14.
+            obj.check_health(14.)
+            self.assertEqual(obj.alarm, 'fault')
+            self.assertNotEqual(obj.alarm_id, old_id)
+
+    def test_new_fault_during_vehicle_quiet_waits_but_is_not_lost(self):
+        obj = watcher()
+        obj.zones = []
+        obj.first_frame_seen = True
+        with mock.patch.object(watch.time, 'monotonic', return_value=100.) as clock:
+            obj.last_frame_at = 100.
+            obj.raise_alarm('main', 'vehicle arrival')
+            obj.acknowledge()
+            for instant in (101., 109.999):
+                clock.return_value = instant
+                obj.check_health(instant)
+                self.assertIsNone(obj.alarm)
+                self.assertTrue(obj.fault_reason)
+            clock.return_value = 110.
+            obj.check_health(110.)
+            self.assertEqual(obj.alarm, 'fault')
+            self.assertEqual(obj._fault_kind, 'lost')
+
+    def test_different_fault_during_fault_quiet_is_deferred_not_lost(self):
+        obj = watcher()
+        obj.zones = []
+        obj.first_frame_seen = True
+        obj.last_frame_at = 1.
+        with mock.patch.object(watch.time, 'monotonic', return_value=3.) as clock:
+            obj.check_health(3.)
+            old_id = obj.alarm_id
+            obj.acknowledge()
+            obj.dark_since = .1
+            clock.return_value = 6.
+            obj.last_frame_at = 6.
+            obj.check_health(6.)
+            self.assertIsNone(obj.alarm)
+            self.assertIn('picture black', obj.fault_reason)
+            clock.return_value = 13.
+            obj.last_frame_at = 13.
+            obj.check_health(13.)
+            self.assertEqual(obj.alarm, 'fault')
+            self.assertEqual(obj._fault_kind, 'black')
+            self.assertNotEqual(obj.alarm_id, old_id)
 
     def test_fault_rearms_when_deliberately_switched_back_on(self):
         obj = watcher()
@@ -194,6 +258,67 @@ class WatcherTests(unittest.TestCase):
         obj.check_health(start + 3.5)
         self.assertEqual(obj.alarm, "fault")
         self.assertIn("bad frame", obj.fault_reason)
+
+    def test_state_exposes_the_alarm_level_behind_each_reading(self):
+        zones = watcher().state_dict()['zones']
+        self.assertTrue(zones)
+        for zone in zones:
+            self.assertIn('light_threshold', zone)
+            self.assertIn('motion_threshold', zone)
+            for key in ('light_threshold', 'motion_threshold'):
+                self.assertTrue(zone[key] is None or isinstance(zone[key], (int, float)))
+
+    def test_a_finished_siren_test_never_silences_a_real_alarm(self):
+        obj = watcher()
+        obj.play_test_tone(seconds=.2)
+        self.assertEqual(obj.buzzer.want, 'main')
+        obj.raise_alarm('fault', 'feed lost')      # a real alarm takes the buzzer
+        time.sleep(.5)
+        self.assertEqual(obj.buzzer.want, 'fault')
+
+    def test_losing_the_camera_closes_the_program_but_a_hiccup_does_not(self):
+        obj = watcher()
+        obj.first_frame_seen = True
+        obj.camera_gone_s = 60.
+        with mock.patch.object(obj, '_request_full_stop') as stop:
+            obj.last_frame_at = 100.
+            obj.check_health(140.)                      # 40 s gap: a reconnect
+            stop.assert_not_called()
+            obj.last_frame_at = 145.                    # frames came back
+            obj.check_health(145.)
+            self.assertEqual(obj.camera_gone_status(145.)['missing_s'], 0.)
+            obj.check_health(210.)                      # 65 s without the camera
+            stop.assert_called_once()
+            self.assertIn('camera offline', stop.call_args.args[0])
+            self.assertEqual(obj.camera_gone_status(210.)['stopping_in_s'], 0.)
+
+    def test_a_camera_that_never_arrived_does_not_close_the_program(self):
+        obj = watcher()
+        obj.first_frame_seen = False
+        obj.camera_gone_s = 30.
+        with mock.patch.object(obj, '_request_full_stop') as stop:
+            obj.last_frame_at = 0.
+            obj.check_health(500.)
+            stop.assert_not_called()
+
+    def test_automatic_stop_is_silent_logged_and_not_repeated(self):
+        obj = watcher()
+        obj.buzzer.set('fault')
+        with mock.patch.dict('sys.modules', {'power_control': mock.MagicMock()}) as modules:
+            obj._request_full_stop('camera offline for 130s')
+            obj._request_full_stop('camera offline for 190s')
+            modules['power_control'].request_full_off.assert_called_once()
+        self.assertIsNone(obj.buzzer.want)
+        self.assertEqual(obj.log_event.call_args.args[0], 'power')
+
+    def test_camera_stop_limit_reads_the_configuration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'zones.json'
+            for value, expected in ((90, 90.), (0, 0.), (5, 30.), ('x', watch.CAMERA_GONE_S), (9e9, 3600.)):
+                path.write_text(json.dumps({"zones": [], "power": {"stop_when_camera_gone_s": value}}))
+                self.assertEqual(watch.Watcher._load_camera_gone_limit(path), expected)
+            path.write_text(json.dumps({"zones": []}))
+            self.assertEqual(watch.Watcher._load_camera_gone_limit(path), watch.CAMERA_GONE_S)
 
     def test_preview_error_is_not_a_detection_fault(self):
         obj = watcher()

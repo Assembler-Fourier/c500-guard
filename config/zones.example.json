@@ -1,69 +1,12 @@
 {
-  "_comment": [
-    "Example zones for a gate or barrier camera. Coordinates are [x, y, width, height] as fractions of the picture.",
-    "Exclude anything that changes on its own (an on-screen clock, a second monitor, the picture border).",
-    "Draw your own at http://127.0.0.1:8787/zones while monitoring is OFF; install copies this file to config/zones.json."
-  ],
+  "_comment": "Generic layout only. Draw and validate zones for your camera before using audible alerts.",
   "zones": [
-    {
-      "name": "A approach",
-      "rect": [
-        0.74,
-        0.2,
-        0.15,
-        0.24
-      ],
-      "motion": true,
-      "light": true,
-      "severity": "main",
-      "light_severity": "early",
-      "motion_pct": 1.8,
-      "light_delta": 12.0,
-      "on_frames": 2,
-      "off_frames": 8
-    },
-    {
-      "name": "B barrier stop",
-      "rect": [
-        0.6,
-        0.26,
-        0.19,
-        0.24
-      ],
-      "motion": true,
-      "light": false,
-      "severity": "main",
-      "motion_pct": 1.5,
-      "on_frames": 2,
-      "off_frames": 8
-    },
-    {
-      "name": "C pedestrian path",
-      "rect": [
-        0.4,
-        0.32,
-        0.22,
-        0.26
-      ],
-      "motion": true,
-      "light": false,
-      "severity": "main",
-      "motion_pct": 1.2,
-      "on_frames": 2,
-      "off_frames": 8
-    }
+    {"name":"Entrance example","rect":[0.55,0.3,0.35,0.5],"polygon":[[0.55,0.3],[0.9,0.3],[0.9,0.8],[0.55,0.8]],"trigger":"ai","classes":["car","truck","bus","motorcycle"],"route_group":"example-entrance","route_role":"entrance","alert_stage":"barrier","ai_confidence":0.5,"ai_confirm_observations":3,"arrival_direction":null,"on_frames":2,"off_frames":4},
+    {"name":"Exit example","rect":[0.1,0.3,0.35,0.5],"polygon":[[0.1,0.3],[0.45,0.3],[0.45,0.8],[0.1,0.8]],"trigger":"ai","classes":["car","truck","bus","motorcycle"],"route_group":"example-exit","route_role":"exit","alert_stage":"barrier","ai_confidence":0.5,"ai_confirm_observations":3,"arrival_direction":null,"on_frames":2,"off_frames":4},
+    {"name":"Footpath example","rect":[0.9,0.2,0.08,0.65],"polygon":[[0.9,0.2],[0.98,0.2],[0.98,0.85],[0.9,0.85]],"trigger":"ai","classes":["person"],"route_role":"pedestrian","ai_confidence":0.6,"ai_confirm_observations":3,"on_frames":2,"off_frames":4}
   ],
-  "alignment": {
-    "enabled": true,
-    "include_rects": [
-      [
-        0.03,
-        0.03,
-        0.94,
-        0.94
-      ]
-    ],
-    "exclude_rects": [],
-    "border_px": 0
-  }
+  "alignment":{"enabled":false},
+  "presence":{"enabled":false},
+  "ai":{"interval_s":0.5,"entrance_verifier":false},
+  "system":{"name":"BarrierWatcher"}
 }

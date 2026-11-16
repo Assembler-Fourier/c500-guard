@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -20,11 +21,14 @@ class HotkeyTests(unittest.TestCase):
         self.user32.SetWindowsHookExW.return_value = 0x123456789ABC
         self.user32.CallNextHookEx.return_value = 0x123456789ABC
         self.user32.GetAsyncKeyState.return_value = 0x8000
+        self.user32.SetTimer.return_value = 77
         self.kernel32.GetModuleHandleW.return_value = 0xABCDEF123456
         self.dll_patch = patch.object(ctypes, "WinDLL", side_effect=[self.user32, self.kernel32])
         self.dll_patch.start()
         self.addCleanup(self.dll_patch.stop)
-        self.hotkey = hk.Hotkey(hk.DEFAULT_API)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.hotkey = hk.Hotkey(hk.DEFAULT_API, state=Path(self.temp.name))
         # Even lifecycle tests cannot read or modify the real watcher.
         self.poll_patch = patch.object(self.hotkey, "_refresh_alarm_status", return_value=(None, None))
         self.poll_patch.start()
@@ -161,18 +165,127 @@ class HotkeyTests(unittest.TestCase):
             calls.append(True)
             if len(calls) == 1:
                 pointer._obj.message = hk.WM_TIMER
+                pointer._obj.wParam = 77
                 return 1
             return 0
 
         self.user32.GetMessageW.side_effect = get_message
-        with patch.object(self.hotkey, "say"):
+        with patch.object(self.hotkey, "say"), \
+                patch.object(self.hotkey._worker, "start"), \
+                patch.object(self.hotkey._input_worker, "start"), \
+                patch.object(hk.time, "monotonic", side_effect=[0, hk.HOOK_REFRESH_MS / 1000]):
             self.assertEqual(self.hotkey.run(), 0)
-        self.assertEqual(self.user32.SetTimer.call_args.args[2], hk.HOOK_REFRESH_MS)
+        self.assertEqual(self.user32.SetTimer.call_args.args[2], hk.POWER_CHECK_MS)
         # Each fresh hook is installed before its predecessor is removed.
         self.assertEqual(self.user32.UnhookWindowsHookEx.call_args_list,
                          [call(0x1001), call(0x1002), call(0x2002), call(0x2001)])
         self.user32.DispatchMessageW.assert_not_called()
         self.user32.KillTimer.assert_called_once_with(None, 77)
+
+    def test_callback_failures_forward_every_ordinary_key_and_mouse_event(self):
+        self.key.vkCode = 0x41
+        for error in (RuntimeError("ack failed"), KeyboardInterrupt(), SystemExit()):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(self.hotkey, "_queue_ack", side_effect=error), \
+                    patch.object(self.hotkey, "say") as say:
+                self.assertEqual(self.press(hk.WM_KEYDOWN), 0x123456789ABC)
+                self.assertEqual(self.hotkey._on_mouse(
+                    hk.HC_ACTION, hk.WM_LBUTTONDOWN, self.mouse_pointer), 0x123456789ABC)
+                say.assert_not_called()
+        self.assertEqual(self.user32.CallNextHookEx.call_count, 6)
+
+    def test_native_forwarding_exception_returns_zero_not_swallow(self):
+        self.key.vkCode = 0x41
+        self.user32.CallNextHookEx.side_effect = RuntimeError("native dispatch failed")
+        self.assertEqual(self.press(hk.WM_KEYUP), 0)
+        self.assertEqual(self.hotkey._on_mouse(-1, hk.WM_LBUTTONDOWN, 0), 0)
+
+    def test_null_event_pointer_fails_open_instead_of_escaping_ctypes(self):
+        self.assertEqual(self.hotkey._on_key(hk.HC_ACTION, hk.WM_KEYDOWN, 0), 0x123456789ABC)
+        self.assertEqual(self.hotkey._on_mouse(hk.HC_ACTION, hk.WM_LBUTTONDOWN, 0), 0x123456789ABC)
+
+    def test_injected_toggle_chord_never_swallowed_or_queued(self):
+        for flags in (hk.LLKHF_INJECTED, hk.LLKHF_LOWER_IL_INJECTED):
+            self.key.flags = flags
+            self.assertEqual(self.press(), 0x123456789ABC)
+        self.assertFalse(self.hotkey._f4_down)
+        self.assertTrue(self.hotkey._requests.empty())
+        self.user32.GetAsyncKeyState.assert_not_called()
+
+    def test_power_off_before_start_installs_no_hooks_or_workers(self):
+        self.hotkey.power_off.write_text("off")
+        with patch.object(self.hotkey, "say"):
+            self.assertEqual(self.hotkey.run(), 0)
+        self.user32.SetWindowsHookExW.assert_not_called()
+        self.user32.SetTimer.assert_not_called()
+        self.assertIsNone(self.hotkey._worker.ident)
+        self.assertIsNone(self.hotkey._input_worker.ident)
+
+    def test_power_off_racing_lock_is_rechecked_before_hook_install(self):
+        with patch.object(self.hotkey, "_power_off_requested", side_effect=[False, True]):
+            self.assertEqual(self.hotkey.run(), 0)
+        self.user32.SetWindowsHookExW.assert_not_called()
+
+    def test_power_off_timer_unhooks_and_terminates_workers(self):
+        def get_message(pointer, *args):
+            self.hotkey.power_off.write_text("off")
+            pointer._obj.message = hk.WM_TIMER
+            pointer._obj.wParam = 77
+            return 1
+        self.user32.GetMessageW.side_effect = get_message
+        with patch.object(self.hotkey, "_refresh_hooks") as refresh:
+            self.assertEqual(self.hotkey.run(), 0)
+        refresh.assert_not_called()
+        self.assertEqual(self.user32.UnhookWindowsHookEx.call_count, 2)
+        self.user32.KillTimer.assert_called_once_with(None, 77)
+        self.assertTrue(self.hotkey._stop.is_set())
+        self.assertFalse(self.hotkey._worker.is_alive())
+        self.assertFalse(self.hotkey._input_worker.is_alive())
+
+    def test_one_second_timer_checks_power_without_refreshing_hooks(self):
+        calls = []
+        def get_message(pointer, *args):
+            calls.append(True)
+            pointer._obj.message = hk.WM_TIMER
+            pointer._obj.wParam = 77
+            return 1 if len(calls) == 1 else 0
+        self.user32.GetMessageW.side_effect = get_message
+        with patch.object(self.hotkey, "_refresh_hooks") as refresh:
+            self.assertEqual(self.hotkey.run(), 0)
+        refresh.assert_not_called()
+        self.assertEqual(self.user32.SetTimer.call_args.args[2], 1000)
+
+    def test_timer_failure_removes_hooks_instead_of_running_without_off_check(self):
+        self.user32.SetTimer.return_value = 0
+        self.assertEqual(self.hotkey.run(), 1)
+        self.assertEqual(self.user32.UnhookWindowsHookEx.call_count, 2)
+        self.user32.GetMessageW.assert_not_called()
+
+    def test_unreadable_off_state_stops_helper_before_installing_hooks(self):
+        with patch.object(Path, "stat", side_effect=PermissionError()):
+            self.assertEqual(self.hotkey.run(), 0)
+        self.user32.SetWindowsHookExW.assert_not_called()
+
+    def test_duplicate_helper_does_not_install_hooks_and_lock_releases_on_exit(self):
+        with hk.helper_lock(self.hotkey.state / "hotkey.lock") as acquired:
+            self.assertTrue(acquired)
+            self.assertEqual(self.hotkey.run(), 0)
+            self.user32.SetWindowsHookExW.assert_not_called()
+        self.user32.GetMessageW.return_value = 0
+        self.assertEqual(self.hotkey.run(), 0)
+        self.assertEqual(self.user32.SetWindowsHookExW.call_count, 2)
+        with hk.helper_lock(self.hotkey.state / "hotkey.lock") as acquired:
+            self.assertTrue(acquired)
+
+    def test_lifecycle_log_contains_pid_start_and_exit_without_input(self):
+        self.hotkey.log_path = self.hotkey.state / "helper.log"
+        self.user32.GetMessageW.return_value = 0
+        self.assertEqual(self.hotkey.run(), 0)
+        content = self.hotkey.log_path.read_text()
+        self.assertIn(f"pid={hk.os.getpid()} input helper starting", content)
+        self.assertIn(f"pid={hk.os.getpid()} input helper exited; result=0", content)
+        self.assertNotIn("vkCode", content)
+        self.assertNotIn("scanCode", content)
 
     def test_failed_hook_refresh_keeps_working_hook(self):
         self.hotkey._hook, self.hotkey._mouse_hook = 0x1001, 0x1002

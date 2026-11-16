@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import contextlib
 import ctypes
 import json
 import math
+import os
 import queue
 import sys
 import threading
@@ -33,6 +35,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+import platform_support as ps
 
 # Virtual key codes
 VK_F4, VK_CONTROL, VK_MENU = 0x73, 0x11, 0x12
@@ -48,12 +52,38 @@ LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED = 0x01, 0x02
 HC_ACTION = 0
 WM_TIMER = 0x0113
 HOOK_REFRESH_MS = 5 * 60 * 1000
+POWER_CHECK_MS = 1000
 SWALLOW = 1          # non-zero return stops the key reaching any other app
 INPUT_POLL_SECONDS = .2
 INPUT_CACHE_MAX_AGE = .75
 INPUT_HTTP_TIMEOUT = .6
 
 DEFAULT_API = "http://127.0.0.1:8787"
+
+
+@contextlib.contextmanager
+def helper_lock(path: Path):
+    """A lifetime OS lock excludes direct starts as well as scheduled starts.
+
+    The file may remain after shutdown; the OS releases its byte lock even if
+    the helper is terminated. Its existence never means a process is alive.
+    """
+    import msvcrt
+    with path.open("a+b") as handle:
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _win_types():
@@ -79,11 +109,13 @@ def _win_types():
 
 class Hotkey:
     def __init__(self, api: str, debug: bool = False, beep_on_off: bool = False,
-                 log: Path | None = None):
+                 log: Path | None = None, *, state: Path | None = None):
         self.api = api.rstrip("/")
         self.debug = debug
         self.beep_on_off = beep_on_off
         self.log_path = log
+        self.state = state if state is not None else ps.state_dir()
+        self.power_off = self.state / "power-off"
         self._wintypes, self._KBD, self._MOUSE, hookproc = _win_types()
         self.user32 = ctypes.WinDLL("user32", use_last_error=True)
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -266,7 +298,7 @@ class Hotkey:
 
     # -- plumbing ---------------------------------------------------------
     def say(self, message: str) -> None:
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {message}"
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  pid={os.getpid()} {message}"
         if self.debug:
             print(line, flush=True)
         if self.log_path:
@@ -307,18 +339,41 @@ class Hotkey:
             self.say(f"watcher not reachable at {self.api}: {exc}")
 
     # -- the hook ---------------------------------------------------------
+    def _forward_input(self, hook, code, wparam, lparam):
+        """No Python exception may escape a native callback as its result.
+
+        Zero is the fail-open fallback if forwarding itself fails. Never log
+        or inspect more input here: this path runs on the Windows hook thread.
+        """
+        try:
+            return self.user32.CallNextHookEx(hook, code, wparam, lparam)
+        except BaseException:
+            return 0
+
     def _on_key(self, code, wparam, lparam):
+        try:
+            if self._handle_key(code, wparam, lparam):
+                return SWALLOW
+        except BaseException:
+            # ctypes otherwise reports an ignored exception and has no defined
+            # Python return value to pass back to Windows. Always forward.
+            self._f4_down = False
+        return self._forward_input(self._hook, code, wparam, lparam)
+
+    def _handle_key(self, code, wparam, lparam):
         if code == HC_ACTION and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP):
             data = ctypes.cast(lparam, ctypes.POINTER(self._KBD)).contents
+            if data.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED):
+                return False
             if data.vkCode == VK_F4:
                 if wparam in (WM_KEYUP, WM_SYSKEYUP):
                     if self._f4_down:
                         self._f4_down = False
-                        return SWALLOW
-                    return self.user32.CallNextHookEx(self._hook, code, wparam, lparam)
+                        return True
+                    return False
                 # Swallow auto-repeat even if a modifier was released first.
                 if self._f4_down:
-                    return SWALLOW
+                    return True
                 # 0x8000 = key currently down.
                 ctrl = self.user32.GetAsyncKeyState(VK_CONTROL) & 0x8000
                 alt = self.user32.GetAsyncKeyState(VK_MENU) & 0x8000
@@ -333,20 +388,22 @@ class Hotkey:
                             self._requests.put_nowait(True)
                             self._last_fire = now
                         except queue.Full:
-                            pass
-                    return SWALLOW
-            if (wparam in (WM_KEYDOWN, WM_SYSKEYDOWN) and
-                    not data.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)):
+                            self._pending.clear()
+                    return True
+            if wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 self._queue_ack("input-any-key")
-        return self.user32.CallNextHookEx(self._hook, code, wparam, lparam)
+        return False
 
     def _on_mouse(self, code, wparam, lparam):
-        if code == HC_ACTION and wparam in MOUSE_BUTTON_DOWN:
-            data = ctypes.cast(lparam, ctypes.POINTER(self._MOUSE)).contents
-            if not data.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED):
-                self._queue_ack("input-mouse")
+        try:
+            if code == HC_ACTION and wparam in MOUSE_BUTTON_DOWN:
+                data = ctypes.cast(lparam, ctypes.POINTER(self._MOUSE)).contents
+                if not data.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED):
+                    self._queue_ack("input-mouse")
+        except BaseException:
+            pass
         # Acknowledging must never suppress a normal click.
-        return self.user32.CallNextHookEx(self._mouse_hook, code, wparam, lparam)
+        return self._forward_input(self._mouse_hook, code, wparam, lparam)
 
     def _refresh_hooks(self, module) -> None:
         """Re-register both hooks; the new one is live before the old one goes.
@@ -367,6 +424,41 @@ class Hotkey:
                 self.user32.UnhookWindowsHookEx(old)
 
     def run(self) -> int:
+        result = 1
+        self.say("input helper starting")
+        try:
+            if self._power_off_requested():
+                self.say("Program is fully OFF; no input hooks installed.")
+                result = 0
+                return result
+            with helper_lock(self.state / "hotkey.lock") as acquired:
+                if not acquired:
+                    self.say("Another input helper is already running; duplicate start ignored.")
+                    result = 0
+                    return result
+                result = self._run_hooks()
+                return result
+        except OSError as exc:
+            self.say(f"Input helper cannot run safely: {type(exc).__name__}")
+            return result
+        finally:
+            self.say(f"input helper exited; result={result}")
+
+    def _power_off_requested(self) -> bool:
+        try:
+            self.power_off.stat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            # If the persistent OFF state is unreadable, do not reserve input.
+            return True
+        return True
+
+    def _run_hooks(self) -> int:
+        # Recheck after the singleton lock, closing a race with full shutdown.
+        if self._power_off_requested():
+            self.say("Program is fully OFF; no input hooks installed.")
+            return 0
         module = self.kernel32.GetModuleHandleW(None)
         timer = None
         self._hook = self.user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc, module, 0)
@@ -386,7 +478,11 @@ class Hotkey:
             self.say(f"Ctrl+Alt+F4 ready; physical key/click acknowledgement ready; "
                      f"talking to {self.api}")
             # A thread timer (no window) posts WM_TIMER to this message loop.
-            timer = self.user32.SetTimer(None, 0, HOOK_REFRESH_MS, None)
+            timer = self.user32.SetTimer(None, 0, POWER_CHECK_MS, None)
+            if not timer:
+                self.say("FATAL: cannot schedule the full-OFF check; removing input hooks.")
+                return 1
+            next_refresh = time.monotonic() + HOOK_REFRESH_MS / 1000
             message = self._wintypes.MSG()
             while True:
                 result = self.user32.GetMessageW(ctypes.byref(message), None, 0, 0)
@@ -395,8 +491,14 @@ class Hotkey:
                 if result == -1:
                     self.say(f"FATAL: keyboard message loop failed (error {ctypes.get_last_error()})")
                     return 1
-                if message.message == WM_TIMER and timer:
-                    self._refresh_hooks(module)
+                if message.message == WM_TIMER and message.wParam == timer:
+                    if self._power_off_requested():
+                        self.say("Program is fully OFF; removing input hooks.")
+                        return 0
+                    now = time.monotonic()
+                    if now >= next_refresh:
+                        self._refresh_hooks(module)
+                        next_refresh = now + HOOK_REFRESH_MS / 1000
                     continue
                 self.user32.TranslateMessage(ctypes.byref(message))
                 self.user32.DispatchMessageW(ctypes.byref(message))
@@ -430,6 +532,9 @@ def main() -> int:
                         help="also beep when switching OFF (default: silent when going off)")
     parser.add_argument("--log", default="")
     args = parser.parse_args()
+    # A keyboard hook in a paged-out, below-normal process delays every
+    # keystroke on the PC. Run at normal priority for as long as we run.
+    ps.normal_priority()
     log = Path(args.log) if args.log else None
     return Hotkey(args.api, args.debug, args.beep_both, log).run()
 

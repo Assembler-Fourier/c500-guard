@@ -60,6 +60,34 @@ class ProcessIdentityTests(unittest.TestCase):
             with self.subTest(image=image, args=args):
                 self.assertFalse(matches(image, args, script))
 
+    def test_windowless_and_isolated_python_identity_require_the_actual_script(self):
+        matches = self.ps._windows_identity_matches
+        image = r'C:\Python\pythonw.exe'
+        launcher, updater = r'C:\C500\src\barrierwatcher_app.pyw', r'C:\Separate\car memory\carmem.py'
+        self.assertTrue(matches(image, ['pythonw', launcher, 'open'], launcher))
+        self.assertTrue(matches(image, ['pythonw', '-I', updater, 'watch'], updater))
+        self.assertTrue(matches(image, ['pythonw', '-I', launcher], launcher))
+        for args in [['pythonw', '-c', updater], ['pythonw', '-I', '-c', updater],
+                     ['pythonw', '-m', 'other', updater], ['pythonw', '-I', 'other.py', updater],
+                     ['pythonw', '-I', updater + '.backup'], ['pythonw', '-I']]:
+            with self.subTest(args=args):
+                self.assertFalse(matches(image, args, updater))
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows native process APIs')
+    def test_real_isolated_windowless_script_has_verified_identity(self):
+        script = self.state / 'isolated child.pyw'
+        script.write_text('import time\ntime.sleep(60)\n')
+        child = subprocess.Popen([sys.executable, '-I', str(script)],
+                                 **self.ps.background_subprocess_kwargs())
+        try:
+            self.assertTrue(self.ps.process_alive(child.pid, str(script), strict=True))
+            self.assertTrue(self.ps.stop_process_tree(child.pid, str(script)))
+            child.wait(timeout=5)
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                child.wait(timeout=5)
+
     def test_invalid_pid_never_opens_a_process(self):
         with patch.object(self.ps, '_WindowsProcess') as native:
             for pid in (-1, 0, True, '1234', 2**32):

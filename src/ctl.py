@@ -31,9 +31,29 @@ REPO = HERE.parent
 STATE = ps.state_dir()
 WATCHER_PID = STATE / "watcher.pid"
 PAUSED = STATE / "service-paused"
+POWER_OFF = STATE / "power-off"
 START_LOCK = STATE / "watcher-start.lock"
 API = "http://127.0.0.1:8787"
 DEFAULT_SOURCE = "rtsp://127.0.0.1:8554/c500"
+BRIDGE_PREFIX = "rtsp://127.0.0.1:8554/"
+SOURCE_FILE = REPO / "config" / "source.json"
+
+
+def configured_source() -> str:
+    """The picture source from config/source.json; the old camera bridge if unset."""
+    try:
+        data = json.loads(SOURCE_FILE.read_text(encoding="utf-8-sig"))
+        source = data.get("source") if isinstance(data, dict) else None
+        if isinstance(source, str) and source.strip():
+            return source.strip()
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_SOURCE
+
+
+def needs_bridge(source: str) -> bool:
+    """Only the camera bridge's own stream needs go2rtc and the LAN relay."""
+    return str(source).startswith(BRIDGE_PREFIX)
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 if ps.WINDOWS:
@@ -86,10 +106,14 @@ def bridge_status() -> dict:
 
 def ensure_bridge() -> bool:
     """Start the bridge and relay, then verify readiness before opening video."""
+    if POWER_OFF.exists():
+        return False
     try:
         result = bridge("start")
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"Bridge could not start: {exc}")
+        return False
+    if POWER_OFF.exists():
         return False
     if result.returncode:
         print(f"Bridge start failed (exit {result.returncode}). See {STATE / 'bridge.log'}")
@@ -160,20 +184,23 @@ def cmd_doctor(_args) -> int:
     check("zones file", (REPO / "config" / "zones.json").is_file(),
           str(REPO / "config" / "zones.json"))
 
-    bridge_state = bridge_status()
-    check("go2rtc bridge running", bool(bridge_state.get("bridge_running"))
-          and not bridge_state.get("api_error"),
-          f"streams={bridge_state.get('streams', [])}")
-    check("camera stream configured", "c500" in bridge_state.get("streams", []),
-          ", ".join(bridge_state.get("streams", [])),
-          fix="run: bridge.py login-details, then add the camera at /add.html")
+    source = configured_source()
+    check("picture source", True, source)
+    bridge_state = bridge_status() if needs_bridge(source) else None
+    if bridge_state is not None:
+        check("go2rtc bridge running", bool(bridge_state.get("bridge_running"))
+              and not bridge_state.get("api_error"),
+              f"streams={bridge_state.get('streams', [])}")
+        check("camera stream configured", "c500" in bridge_state.get("streams", []),
+              ", ".join(bridge_state.get("streams", [])),
+              fix="run: bridge.py login-details, then add the camera at /add.html")
 
-    # Only installs whose camera needs the broadcast relay report this key. If
-    # the relay dies the camera goes dark, so it belongs in the health check.
-    if "lan_relay_pid" in bridge_state:
-        check("LAN discovery relay", bool(bridge_state.get("lan_relay_pid")),
-              f"pid={bridge_state.get('lan_relay_pid')}",
-              fix="relay not running; run: bridge.py start")
+        # Only installs whose camera needs the broadcast relay report this key. If
+        # the relay dies the camera goes dark, so it belongs in the health check.
+        if "lan_relay_pid" in bridge_state:
+            check("LAN discovery relay", bool(bridge_state.get("lan_relay_pid")),
+                  f"pid={bridge_state.get('lan_relay_pid')}",
+                  fix="relay not running; run: bridge.py start")
 
     state = watcher_state()
     check("watcher running", state is not None, API,
@@ -222,15 +249,16 @@ def cmd_doctor(_args) -> int:
     print()
     if problems:
         print(f"{RED}{len(problems)} problem(s):{RESET} " + ", ".join(problems))
-        print(f"{DIM}  See {REPO / 'docs' / 'c500-guard-runbook.pdf'} "
-              f"section 4 - every known error and its fix.{RESET}")
+        print(f"{DIM}  See {REPO / 'docs' / 'WINDOWS.md'} "
+              f"for setup and troubleshooting.{RESET}")
         return 1
     print(f"{GREEN}All checks passed.{RESET}")
     return 0
 
 
 def cmd_status(_args) -> int:
-    print(bridge("status").stdout.strip())
+    if needs_bridge(configured_source()):
+        print(bridge("status").stdout.strip())
     state = watcher_state()
     if not state:
         print(json.dumps({"watcher_running": False}))
@@ -270,19 +298,30 @@ def cmd_ack(_args) -> int:
 
 
 def cmd_start(args) -> int:
-    if getattr(args, "resume", True):
-        PAUSED.unlink(missing_ok=True)
+    if not getattr(args, "source", None):
+        args.source = configured_source()
+    if POWER_OFF.exists():
+        print("The whole program is OFF. Open the BarrierWatcher app (desktop or Start menu) to start it.")
+        return 1
     with process_lock(START_LOCK) as acquired:
         if not acquired:
             print("Watcher startup is already in progress.")
             return 1
+        if POWER_OFF.exists():
+            print("Watcher startup cancelled by full program OFF.")
+            return 1
+        if getattr(args, "resume", True):
+            PAUSED.unlink(missing_ok=True)
         return start_watcher(args)
 
 
 def start_watcher(args) -> int:
-    if not ensure_bridge():
+    if POWER_OFF.exists() or PAUSED.exists():
+        print("Watcher startup cancelled by a stop request.")
+        return 0
+    if needs_bridge(args.source) and not ensure_bridge():
         return 1
-    if PAUSED.exists():
+    if PAUSED.exists() or POWER_OFF.exists():
         print("Watcher startup cancelled by ctl.py stop.")
         return 0
     state = watcher_state()
@@ -304,14 +343,17 @@ def start_watcher(args) -> int:
     cmd = [venv_python(), str(HERE / "watch.py"), "watch", args.source,
            "--zones", str(REPO / "config" / "zones.json"), "--web", "8787"]
     ps.rotate_log(STATE / "watcher.log")
+    if POWER_OFF.exists() or PAUSED.exists():
+        print("Watcher startup cancelled before launch.")
+        return 0
     with (STATE / "watcher.log").open("ab") as handle:
         child = ps.popen_detached(cmd, handle)
     WATCHER_PID.write_text(str(child.pid) + "\n")
     for _ in range(60):
-        if PAUSED.exists():
+        if PAUSED.exists() or POWER_OFF.exists():
             break
         if watcher_state():
-            if PAUSED.exists():
+            if PAUSED.exists() or POWER_OFF.exists():
                 break
             print(f"Watcher started (pid {child.pid}). Open {API}")
             return 0
@@ -323,7 +365,7 @@ def start_watcher(args) -> int:
     # The watcher may have become ready at the timeout boundary. Otherwise,
     # stop its entire verified tree: terminating a venv launcher alone can
     # orphan the actual Python watcher and ffmpeg process.
-    if not PAUSED.exists() and watcher_state():
+    if not PAUSED.exists() and not POWER_OFF.exists() and watcher_state():
         print(f"Watcher started (pid {child.pid}). Open {API}")
         return 0
     try:
@@ -378,7 +420,7 @@ def main() -> int:
                      ("stop", cmd_stop)):
         sub.add_parser(name).set_defaults(func=fn)
     start = sub.add_parser("start")
-    start.add_argument("--source", default=DEFAULT_SOURCE)
+    start.add_argument("--source", default=None)
     start.set_defaults(func=cmd_start)
     test = sub.add_parser("test-alarm")
     test.add_argument("--seconds", type=float, default=3.0)

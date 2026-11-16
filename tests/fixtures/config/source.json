@@ -1,0 +1,4 @@
+{
+  "_fixture_notice": "Synthetic USB product identifier; never connect a camera in tests.",
+  "source": "usbcam:12ab:3456"
+}

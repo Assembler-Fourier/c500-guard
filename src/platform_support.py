@@ -273,6 +273,77 @@ def audio_output_status() -> dict:
             ole32.CoUninitialize()
 
 
+def set_audio_output(volume: float | None = None, muted: bool | None = None) -> dict:
+    """Set the default speaker's level (0..1) and mute state. Windows only.
+
+    Deliberately separate from `audio_output_status`, which is guaranteed never
+    to change anything: a read that could write would be a trap. The alarm is
+    the only caller, it saves the previous state first, and it puts it back when
+    the alarm ends - a guard's music should come back the way they left it.
+    """
+    if not WINDOWS:
+        return {"applied": False, "detail": "Speaker control is Windows-only"}
+    if volume is None and muted is None:
+        return {"applied": False, "detail": "nothing to change"}
+    import ctypes
+    from ctypes import wintypes as wt
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                    ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+    ole32 = ctypes.OleDLL("ole32")
+
+    def guid(text):
+        value = GUID()
+        ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(value))
+        return value
+
+    def method(obj, index, *argtypes):
+        vtable = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        return ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, *argtypes)(vtable[index])
+
+    def release(obj):
+        if obj:
+            vtable = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+            ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])(obj)
+
+    initialized = False
+    try:
+        ole32.CoInitializeEx(None, 0)
+        initialized = True
+    except OSError:
+        pass
+    enumerator, device, endpoint = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    try:
+        ole32.CoCreateInstance(ctypes.byref(guid("{BCDE0395-E52F-467C-8E3D-C4579291692E}")), None, 0x17,
+                               ctypes.byref(guid("{A95664D2-9614-4F35-A746-DE8DB63617E6}")),
+                               ctypes.byref(enumerator))
+        method(enumerator, 4, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(
+            enumerator, 0, 1, ctypes.byref(device))
+        method(device, 3, ctypes.POINTER(GUID), wt.DWORD, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))(
+            device, ctypes.byref(guid("{5CDF2C82-841E-4546-9722-0CF74078229A}")), 0x17, None,
+            ctypes.byref(endpoint))
+        applied = {}
+        if volume is not None:
+            level = min(1.0, max(0.0, float(volume)))
+            # SetMasterVolumeLevelScalar(float, LPCGUID)
+            method(endpoint, 7, ctypes.c_float, ctypes.c_void_p)(endpoint, ctypes.c_float(level), None)
+            applied["volume"] = round(level, 3)
+        if muted is not None:
+            # SetMute(BOOL, LPCGUID)
+            method(endpoint, 14, wt.BOOL, ctypes.c_void_p)(endpoint, wt.BOOL(bool(muted)), None)
+            applied["muted"] = bool(muted)
+        return {"applied": True, **applied}
+    except OSError as exc:
+        return {"applied": False, "detail": f"Speaker refused the change ({exc})"}
+    finally:
+        for obj in (endpoint, device, enumerator):
+            release(obj)
+        if initialized:
+            ole32.CoUninitialize()
+
+
 def rotate_log(path: Path, max_bytes: int = 5_000_000) -> None:
     """Keep one previous generation. Call just before opening a log to append."""
     try:
@@ -380,6 +451,97 @@ def camera_input(name: str, fps: float) -> list[str]:
     return ["-f", "v4l2", "-framerate", str(fps), "-i", name or "/dev/video0"]
 
 
+_USB_ID = re.compile(r"^([0-9a-f]{4}):([0-9a-f]{4})$")
+_DSHOW_NAME = re.compile(r'^\[[^\]]*\]\s+"(?P<name>[^"]+)"\s+\((?P<kind>video|audio|none)\)\s*$')
+_DSHOW_ALT = re.compile(r'^\[[^\]]*\]\s+Alternative name\s+"(?P<alt>[^"]+)"\s*$')
+
+
+def parse_usb_id(value) -> tuple[str, str]:
+    """'345F:2109' -> ('345f', '2109'); anything else is refused."""
+    match = _USB_ID.match(str(value or "").strip().lower())
+    if not match:
+        raise ValueError(f"USB id must look like 345f:2109, not {value!r}")
+    return match.group(1), match.group(2)
+
+
+def parse_dshow_devices(text: str) -> list[dict]:
+    """Video devices from `ffmpeg -list_devices`, in DirectShow (and OpenCV) order."""
+    devices, last = [], None
+    for line in text.splitlines():
+        line = line.strip()
+        named = _DSHOW_NAME.match(line)
+        if named:
+            last = None
+            if named.group("kind") == "video":
+                last = {"name": named.group("name"), "path": "", "usb_id": ""}
+                devices.append(last)
+            continue
+        alternative = _DSHOW_ALT.match(line)
+        if alternative and last is not None and not last["path"]:
+            last["path"] = alternative.group("alt")
+            ids = re.search(r"vid_([0-9a-f]{4})&pid_([0-9a-f]{4})", last["path"].lower())
+            if ids:
+                last["usb_id"] = f"{ids.group(1)}:{ids.group(2)}"
+    return devices
+
+
+def dshow_video_devices(timeout: float = 15.0) -> list[dict]:
+    """List video capture devices without opening any of them."""
+    command = list_devices_command()
+    if not WINDOWS or not command:
+        return []
+    result = subprocess.run(command, capture_output=True, text=True, errors="replace",
+                            timeout=timeout, stdin=subprocess.DEVNULL,
+                            **background_subprocess_kwargs())
+    return parse_dshow_devices((result.stderr or "") + "\n" + (result.stdout or ""))
+
+
+def find_usb_camera(usb_id: str, devices: list[dict] | None = None) -> tuple[int, dict] | None:
+    """(index, device) of the one camera with this USB id; None if absent or ambiguous."""
+    wanted = ":".join(parse_usb_id(usb_id))
+    devices = dshow_video_devices() if devices is None else devices
+    found = [(index, device) for index, device in enumerate(devices)
+             if device.get("usb_id") == wanted and device.get("path")]
+    return found[0] if len(found) == 1 else None
+
+
+def normal_priority(handle=None) -> dict:
+    """Run at normal CPU and memory priority, without power throttling.
+
+    Task Scheduler starts programs at below-normal priority with low memory
+    priority, so Windows pages them out first when RAM is short. Measured on
+    13 Nov 2026 with 87% of 7.6 GB in use: the watcher had 147 of 524 MB
+    resident and froze for 4-21 s at a time. A keyboard hook in such a process
+    delays every keystroke. This changes only the given process (default: this
+    one) for as long as it runs; no Windows setting is touched.
+    """
+    result = {"priority": False, "memory": False, "throttling": False}
+    if not WINDOWS:
+        return result
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        target = wintypes.HANDLE(int(handle)) if handle is not None else kernel32.GetCurrentProcess()
+        result["priority"] = bool(kernel32.SetPriorityClass(target, 0x00000020))       # NORMAL_PRIORITY_CLASS
+        memory = wintypes.ULONG(5)                                                      # MEMORY_PRIORITY_NORMAL
+        result["memory"] = bool(kernel32.SetProcessInformation(target, 0, ctypes.byref(memory),
+                                                               ctypes.sizeof(memory)))   # ProcessMemoryPriority
+
+        class PowerThrottling(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG),
+                        ("StateMask", wintypes.ULONG)]
+        state = PowerThrottling(1, 1, 0)        # control EXECUTION_SPEED, state off: never throttle
+        result["throttling"] = bool(kernel32.SetProcessInformation(target, 4, ctypes.byref(state),
+                                                                   ctypes.sizeof(state)))  # ProcessPowerThrottling
+    except (OSError, AttributeError, ValueError, TypeError):
+        pass
+    return result
+
+
 def list_devices_command() -> list[str] | None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -394,6 +556,63 @@ def list_devices_command() -> list[str] | None:
 # ---------------------------------------------------------------------------
 # Process helpers
 # ---------------------------------------------------------------------------
+
+_CHILD_JOB = None
+
+
+def tie_to_this_process(process) -> bool:
+    """Make Windows end this child whenever this process ends, even by a crash or a kill.
+
+    One Job object with KILL_ON_JOB_CLOSE is held for the life of this process;
+    only children handed to this function are in it. Nothing else is affected,
+    and nothing is left running when the watcher stops for any reason.
+    """
+    global _CHILD_JOB
+    handle = getattr(process, "_handle", None)
+    if not WINDOWS or handle is None:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes as wt
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        if _CHILD_JOB is None:
+            kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wt.LPCWSTR]
+            kernel.CreateJobObjectW.restype = wt.HANDLE
+            kernel.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
+            kernel.SetInformationJobObject.restype = wt.BOOL
+
+            class Basic(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                            ("LimitFlags", wt.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wt.DWORD),
+                            ("Affinity", ctypes.c_size_t), ("PriorityClass", wt.DWORD),
+                            ("SchedulingClass", wt.DWORD)]
+
+            class Counters(ctypes.Structure):
+                _fields_ = [(name, ctypes.c_uint64) for name in (
+                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+            class Extended(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", Counters),
+                            ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            job = kernel.CreateJobObjectW(None, None)
+            if not job:
+                return False
+            info = Extended()
+            info.BasicLimitInformation.LimitFlags = 0x2000          # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not kernel.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                kernel.CloseHandle(job)
+                return False
+            _CHILD_JOB = job
+        kernel.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+        kernel.AssignProcessToJobObject.restype = wt.BOOL
+        return bool(kernel.AssignProcessToJobObject(_CHILD_JOB, int(handle)))
+    except Exception:                                              # noqa: BLE001 - optional safety net
+        return False
+
 
 def background_subprocess_kwargs() -> dict:
     """Keep Windows console helpers from opening a window under pythonw.
@@ -418,15 +637,16 @@ def _windows_identity_matches(image: str, argv: list[str], expected: str) -> boo
         return False
     wanted = normalized(expected)
     absolute = ntpath.isabs(expected)
-    if expected.lower().endswith('.py'):
+    if expected.lower().endswith(('.py', '.pyw')):
         interpreter = ntpath.basename(image).lower()
         if not re.fullmatch(r'python(?:\d+(?:\.\d+)*)?w?\.exe', interpreter):
             return False
-        # All app launchers pass the absolute script directly after Python.
-        # A -c string or unrelated script's argument is not process identity.
-        if len(argv) < 2:
+        # The car-memory updater uses isolated mode. Accept only this known
+        # prefix; -c/-m text and an unrelated script's arguments are not identity.
+        script_index = 2 if len(argv) > 1 and argv[1] == '-I' else 1
+        if len(argv) <= script_index:
             return False
-        script = normalized(argv[1])
+        script = normalized(argv[script_index])
         return script == wanted if absolute else ntpath.basename(script) == wanted
     actual = normalized(image)
     if absolute:
@@ -489,7 +709,7 @@ class _WindowsProcess:
         image = c.create_unicode_buffer(size.value)
         if not query_image(self.handle, 0, image, c.byref(size)):
             raise PermissionError(f'Cannot read executable for process {self.pid}')
-        argv = self._arguments() if expected.lower().endswith('.py') else []
+        argv = self._arguments() if expected.lower().endswith(('.py', '.pyw')) else []
         return _windows_identity_matches(image.value, argv, expected)
 
     def _arguments(self) -> list[str]:

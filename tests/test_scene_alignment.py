@@ -40,6 +40,19 @@ class AlignmentTests(unittest.TestCase):
         self.aligner = SceneAligner(self.reference, self.mask)
         self.assertTrue(self.aligner.reference_ready, self.aligner.status())
 
+    def test_feature_polygon_intersects_existing_motion_exclusions(self):
+        mask = build_feature_mask(self.reference.shape,
+            include_polygon=[[.1, .1], [.9, .1], [.9, .9], [.1, .9]],
+            exclude_rects=[[.3, .3, .2, .2]], border_px=0)
+        self.assertEqual(mask[180, 10], 0)
+        self.assertEqual(mask[150, 250], 0)
+        self.assertEqual(mask[80, 320], 255)
+
+    def test_feature_polygon_rejects_unbounded_geometry(self):
+        with self.assertRaises(ValueError):
+            build_feature_mask(self.reference.shape,
+                               include_polygon=[[0, 0], [1.1, 0], [1, 1]])
+
     def assert_transform(self, dx=0., dy=0., angle=0., scale=1.):
         current, forward = shifted(self.reference, dx, dy, angle, scale)
         original_current = current.copy()

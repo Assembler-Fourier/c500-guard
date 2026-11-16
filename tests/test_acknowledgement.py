@@ -1,5 +1,7 @@
 """Quiet deadlines, input races and local HTTP acknowledgement contract."""
 import json
+from pathlib import Path
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -20,18 +22,19 @@ class AcknowledgementTests(unittest.TestCase):
         mock.patch.stopall()
 
     def test_all_channels_quiet_until_exact_deadline(self):
+        self.assertEqual(self.obj.ack_quiet_s, 10.)
         self.obj.raise_alarm('main', 'arrival')
         self.assertTrue(self.obj.acknowledge())
         self.obj.log_event.reset_mock()
         self.notify.reset_mock()
-        for instant in (100., 102., 104.999):
+        for instant in (100., 105., 109.999):
             self.clock.return_value = instant
             for kind in ('early', 'main', 'fault'):
                 self.assertFalse(self.obj.raise_alarm(kind, 'during quiet'))
                 self.assertIsNone(self.obj.buzzer.want)
         self.assertFalse(self.obj.log_event.called)
         self.assertFalse(self.notify.called)
-        self.clock.return_value = 105.
+        self.clock.return_value = 110.
         self.assertTrue(self.obj.raise_alarm('main', 'current arrival'))
         self.assertEqual(self.obj.buzzer.want, 'main')
 
@@ -44,7 +47,7 @@ class AcknowledgementTests(unittest.TestCase):
         self.clock.return_value = 103.
         self.assertFalse(self.obj.acknowledge(alarm_id))
         self.assertFalse(self.obj.acknowledge())
-        self.assertEqual(self.obj.input_status()['ack_remaining_s'], 2.)
+        self.assertEqual(self.obj.input_status()['ack_remaining_s'], 7.)
         self.assertIsNone(self.obj.input_status()['alarm_id'])
 
     def test_global_input_counts_only_after_one_audible_second(self):
@@ -118,7 +121,7 @@ class AcknowledgementTests(unittest.TestCase):
             self.obj.set_armed(False)
             self.assertEqual(self.obj.control_warning, '')
 
-    def test_current_motion_rechecked_but_departed_motion_not_replayed(self):
+    def test_accepted_motion_episode_not_replayed_after_quiet(self):
         for still_present in (True, False):
             with self.subTest(still_present=still_present):
                 obj = watcher()
@@ -137,9 +140,9 @@ class AcknowledgementTests(unittest.TestCase):
                 self.clock.return_value = 103.
                 obj.process(changed if still_present else base)
                 self.assertIsNone(obj.alarm)
-                self.clock.return_value = 105.
+                self.clock.return_value = 110.
                 obj.process(changed if still_present else base)
-                self.assertEqual(obj.alarm, 'main' if still_present else None)
+                self.assertIsNone(obj.alarm, 'An accepted episode stays consumed until it clears')
 
     def test_fault_cleared_during_quiet_not_replayed(self):
         self.obj.first_frame_seen = True
@@ -151,6 +154,22 @@ class AcknowledgementTests(unittest.TestCase):
         self.obj.check_health(105.)
         self.assertIsNone(self.obj.alarm)
         self.assertEqual(self.obj.fault_reason, '')
+        self.clock.return_value = 110.
+        self.obj.last_frame_at = 110.
+        self.obj.check_health(110.)
+        self.assertIsNone(self.obj.alarm)
+        self.assertEqual(self.obj.fault_reason, '')
+
+    def test_ack_quiet_defaults_to_ten_and_allows_explicit_legacy_setting(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'zones.json'
+            self.assertEqual(watch.Watcher._load_ack_quiet(path), 10.)
+            path.write_text('{}')
+            self.assertEqual(watch.Watcher._load_ack_quiet(path), 10.)
+            path.write_text('{"alarms":{"ack_quiet_s":5}}')
+            self.assertEqual(watch.Watcher._load_ack_quiet(path), 5.)
+            path.write_text('{"alarms":{"ack_quiet_s":true}}')
+            self.assertEqual(watch.Watcher._load_ack_quiet(path), 10.)
 
 
 class InputAPIContractTests(unittest.TestCase):
@@ -175,7 +194,8 @@ class InputAPIContractTests(unittest.TestCase):
     def test_input_status_is_minimal_and_conditional_ack_is_atomic(self):
         self.obj.raise_alarm('main', 'arrival')
         status = self.request('/input-status')
-        self.assertEqual(set(status), {'armed','alarm_id','alarm_started_at','ack_remaining_s'})
+        self.assertEqual(set(status), {'armed','alarm_id','alarm_started_at','ack_remaining_s','ack_quiet_s'})
+        self.assertEqual(status['ack_quiet_s'], 10.)
         self.assertTrue(status['alarm_id'])
         self.obj.raise_alarm('fault', 'fault superseded arrival')
         self.obj.alarm_since -= self.obj.input_ack_min_s  # The siren has now been heard.
@@ -184,7 +204,7 @@ class InputAPIContractTests(unittest.TestCase):
         self.assertEqual(self.obj.alarm, 'fault')
         result = self.request('/ack', json.dumps({'alarm_id':self.obj.alarm_id}).encode(), via='input-mouse')
         self.assertTrue(result['acknowledged'])
-        self.assertGreater(result['ack_remaining_s'], 4.8)
+        self.assertGreater(result['ack_remaining_s'], 9.8)
         self.assertIsNone(self.obj.alarm)
 
     def test_helper_polls_are_visible_and_alert_images_are_name_checked(self):
@@ -196,6 +216,16 @@ class InputAPIContractTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(urllib.error.HTTPError) as caught:
                 self.request('/alerts/' + name)
             self.assertEqual(caught.exception.code, 404)
+
+    def test_siren_test_plays_but_never_during_a_real_alarm(self):
+        result = self.request('/test-tone', b'', via='web')
+        self.assertTrue(result['played'])
+        self.assertEqual(self.obj.buzzer.want, 'main')
+        self.obj.raise_alarm('main', 'arrival')
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.request('/test-tone', b'', via='web')
+        self.assertEqual(caught.exception.code, 409)
+        self.assertEqual(self.obj.buzzer.want, 'main')
 
     def test_bad_input_payloads_and_cross_origin_cannot_ack(self):
         self.obj.raise_alarm('main', 'arrival')

@@ -3,7 +3,7 @@
 
     Installs prerequisites, builds the Python environment, fetches and verifies
     go2rtc, and registers scheduled tasks so the alarm and the Ctrl+Alt+F4 key
-    start automatically at logon.
+    start only through explicit C500 ON.
 
     Run from an ELEVATED PowerShell:
         Set-ExecutionPolicy -Scope Process Bypass -Force
@@ -46,7 +46,7 @@ Write-Host '====================' -ForegroundColor Cyan
 Write-Host ''
 Write-Host '  Current Windows setup and repair instructions:' -ForegroundColor Cyan
 Write-Host "    $Root\docs\WINDOWS.md"
-Write-Host '  The older PDF covers historical camera-login troubleshooting.'
+Write-Host '  Camera credentials and calibration must be supplied locally.'
 
 # ---------------------------------------------------------------- uninstall
 if ($Uninstall) {
@@ -248,41 +248,10 @@ if (-not (Test-Path $zones)) {
     Good 'created config\zones.json from the example'
 }
 
-# ------------------------------------------------------------ autostart
+# ------------------------------------------------------ explicit power controls
 if (-not $NoTasks) {
-    Say 'Registering autostart tasks...'
-    $user = "$env:USERDOMAIN\$env:USERNAME"
-    $TaskPython = Resolve-TaskPython $VenvPy
-    Good "Task interpreter: $TaskPython"
-
-    # The supervisor restores bridge + optional relay before starting the watcher,
-    # retries failed processes, and respects ctl.py stop and saved armed state.
-    $aService = New-ScheduledTaskAction -Execute $TaskPython `
-                -Argument "`"$(Join-Path $Src 'service.py')`"" `
-                -WorkingDirectory $Src
-    # The hotkey: needs an interactive desktop session to hook the keyboard.
-    $aKey   = New-ScheduledTaskAction -Execute $TaskPython `
-                -Argument "`"$(Join-Path $Src 'hotkey_win.py')`" --log `"$env:LOCALAPPDATA\c500-guard\hotkey.log`"" `
-                -WorkingDirectory $Src
-
-    $trigger  = New-ScheduledTaskTrigger -AtLogOn -User $user
-    $principal= New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-                  -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
-                  -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
-                  -StartWhenAvailable
-
-    # Retire the earlier direct watcher task to prevent duplicate capture loops.
-    if (Get-ScheduledTask -TaskName $TaskGuard -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask -TaskName $TaskGuard -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName $TaskGuard -Confirm:$false
-    }
-    foreach ($pair in @(@{n=$TaskService;a=$aService}, @{n=$TaskKey;a=$aKey})) {
-        Register-ScheduledTask -TaskName $pair.n -Action $pair.a -Trigger $trigger `
-            -Principal $principal -Settings $settings -Force | Out-Null
-        Enable-ScheduledTask -TaskName $pair.n | Out-Null
-        Good "registered: $($pair.n)"
-    }
+    & (Join-Path $Src 'install_power.ps1') -Root $Root
+    if (!$?) { Die 'Power control registration failed.' }
 }
 
 # ------------------------------------------------------------------- report
@@ -306,16 +275,16 @@ Write-Host '     Then open http://127.0.0.1:8787'
 if (-not $NoTasks) {
     Write-Host "       Start-ScheduledTask -TaskName '$TaskService'"
     Write-Host "       Start-ScheduledTask -TaskName '$TaskKey'"
-    Write-Host '     These tasks also start automatically at your next sign-in.'
+    Write-Host '     Use C500 ON to start; C500 OFF fully stops the stack. No start at sign-in.'
 }
 Write-Host ''
 Write-Host '  3. While disarmed, draw and save zones at http://127.0.0.1:8787/zones'
 Write-Host '     Confirm live frames and Local AI, test the speaker, then arm explicitly.'
 Write-Host ''
-Write-Host '  Ctrl+Alt+F4 turns the system on and off from anywhere.' -ForegroundColor Green
+Write-Host '  Ctrl+Alt+F4 pauses/resumes alerts only. Use C500 OFF to stop the whole program.' -ForegroundColor Green
 Write-Host ''
 Write-Host 'IF SOMETHING GOES WRONG' -ForegroundColor Cyan
-Write-Host "  Read: $Root\docs\c500-guard-runbook.pdf  (section 4 = every known error + fix)"
+Write-Host "  Read: $Root\docs\WINDOWS.md  (setup and troubleshooting)"
 Write-Host '  The two that cost the most time:'
 Write-Host '    - Xiaomi login must use your NUMERIC Mi Account ID, not your email (error 70016)'
 Write-Host '    - Login can succeed and still list no devices if the region is wrong'

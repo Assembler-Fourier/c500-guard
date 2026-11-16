@@ -1,0 +1,851 @@
+{
+  "zones": [
+    {
+      "name": "Exit corner - tail lights",
+      "rect": [
+        0.12,
+        0.72,
+        0.38,
+        0.2
+      ],
+      "polygon": [
+        [
+          0.12,
+          0.72
+        ],
+        [
+          0.5,
+          0.72
+        ],
+        [
+          0.5,
+          0.92
+        ],
+        [
+          0.12,
+          0.92
+        ]
+      ],
+      "trigger": "taillight",
+      "classes": [],
+      "motion": false,
+      "light": true,
+      "severity": "main",
+      "light_severity": "main",
+      "on_frames": 2,
+      "off_frames": 15,
+      "priority": true,
+      "route_group": "campus-exit",
+      "route_role": "exit",
+      "alert_stage": "advance",
+      "taillight_red_pct": 2.0,
+      "taillight_change_pct": 10.0,
+      "taillight_wake_pct": 5.0
+    },
+    {
+      "name": "Exit approach",
+      "polygon": [
+        [
+          0.12,
+          0.7
+        ],
+        [
+          0.3,
+          0.69
+        ],
+        [
+          0.37,
+          0.645
+        ],
+        [
+          0.41,
+          0.6
+        ],
+        [
+          0.44,
+          0.555
+        ],
+        [
+          0.585,
+          0.555
+        ],
+        [
+          0.598,
+          0.62
+        ],
+        [
+          0.59,
+          0.665
+        ],
+        [
+          0.555,
+          0.745
+        ],
+        [
+          0.51,
+          0.84
+        ],
+        [
+          0.47,
+          0.92
+        ],
+        [
+          0.19,
+          0.92
+        ],
+        [
+          0.2,
+          0.85
+        ],
+        [
+          0.12,
+          0.82
+        ]
+      ],
+      "classes": [
+        "car",
+        "motorcycle",
+        "bus",
+        "truck"
+      ],
+      "trigger": "ai",
+      "priority": true,
+      "route_group": "campus-exit",
+      "route_role": "exit",
+      "arrival_direction": [
+        0.35,
+        -1.0
+      ],
+      "arrival_min_progress": 0.012,
+      "stationary_confirm_s": 3,
+      "ai_confidence": 0.5,
+      "ai_confirm_observations": 2,
+      "motion": false,
+      "light": false,
+      "severity": "main",
+      "on_frames": 3,
+      "off_frames": 15,
+      "motion_pct": 1.2,
+      "alert_stage": "advance",
+      "rect": [
+        0.12,
+        0.555,
+        0.478,
+        0.365
+      ],
+      "bottom_edge_entry": true,
+      "ai_confidence_moving": 0.3
+    },
+    {
+      "name": "Exit barrier",
+      "polygon": [
+        [
+          0.47,
+          0.47
+        ],
+        [
+          0.495,
+          0.447
+        ],
+        [
+          0.615,
+          0.457
+        ],
+        [
+          0.62,
+          0.53
+        ],
+        [
+          0.605,
+          0.6
+        ],
+        [
+          0.59,
+          0.625
+        ],
+        [
+          0.43,
+          0.625
+        ],
+        [
+          0.42,
+          0.58
+        ],
+        [
+          0.45,
+          0.52
+        ]
+      ],
+      "classes": [
+        "car",
+        "motorcycle",
+        "bus",
+        "truck"
+      ],
+      "trigger": "ai",
+      "priority": true,
+      "route_group": "campus-exit",
+      "route_role": "exit",
+      "arrival_direction": [
+        0.35,
+        -1.0
+      ],
+      "ai_confirm_observations": 3,
+      "ai_confidence": 0.6,
+      "stationary_confirm_s": 3,
+      "motion": false,
+      "light": false,
+      "severity": "main",
+      "on_frames": 2,
+      "off_frames": 8,
+      "motion_pct": 1.2,
+      "alert_stage": "barrier",
+      "rect": [
+        0.42,
+        0.447,
+        0.2,
+        0.178
+      ]
+    },
+    {
+      "name": "Top road arrival",
+      "polygon": [
+        [
+          0.45,
+          0.285
+        ],
+        [
+          0.58,
+          0.3
+        ],
+        [
+          0.74,
+          0.34
+        ],
+        [
+          0.81,
+          0.365
+        ],
+        [
+          0.87,
+          0.4
+        ],
+        [
+          0.905,
+          0.44
+        ],
+        [
+          0.905,
+          0.49
+        ],
+        [
+          0.86,
+          0.49
+        ],
+        [
+          0.8,
+          0.458
+        ],
+        [
+          0.73,
+          0.432
+        ],
+        [
+          0.67,
+          0.415
+        ],
+        [
+          0.58,
+          0.38
+        ],
+        [
+          0.45,
+          0.35
+        ]
+      ],
+      "classes": [
+        "car",
+        "motorcycle",
+        "bus",
+        "truck"
+      ],
+      "trigger": "ai",
+      "priority": true,
+      "route_group": "campus-entrance",
+      "route_role": "entrance",
+      "arrival_direction": [
+        1.0,
+        0.5
+      ],
+      "arrival_min_progress": 0.012,
+      "stationary_confirm_s": 0,
+      "ai_confidence": 0.55,
+      "ai_confirm_observations": 2,
+      "motion": false,
+      "light": false,
+      "severity": "main",
+      "on_frames": 3,
+      "off_frames": 15,
+      "motion_pct": 1.2,
+      "alert_stage": "advance",
+      "rect": [
+        0.45,
+        0.285,
+        0.455,
+        0.205
+      ],
+      "ai_confirmation_window_s": 1.5,
+      "approach_motion": true
+    },
+    {
+      "name": "Top road first sighting",
+      "polygon": [
+        [
+          0.45,
+          0.285
+        ],
+        [
+          0.58,
+          0.3
+        ],
+        [
+          0.74,
+          0.34
+        ],
+        [
+          0.81,
+          0.365
+        ],
+        [
+          0.87,
+          0.4
+        ],
+        [
+          0.905,
+          0.44
+        ],
+        [
+          0.905,
+          0.49
+        ],
+        [
+          0.86,
+          0.49
+        ],
+        [
+          0.8,
+          0.458
+        ],
+        [
+          0.73,
+          0.432
+        ],
+        [
+          0.67,
+          0.415
+        ],
+        [
+          0.58,
+          0.38
+        ],
+        [
+          0.45,
+          0.35
+        ]
+      ],
+      "classes": [
+        "car",
+        "motorcycle",
+        "bus",
+        "truck"
+      ],
+      "trigger": "ai",
+      "priority": true,
+      "route_group": "campus-entrance",
+      "route_role": "entrance",
+      "arrival_direction": null,
+      "arrival_min_progress": 0.012,
+      "stationary_confirm_s": 0,
+      "ai_confidence": 0.35,
+      "ai_confirm_observations": 2,
+      "motion": false,
+      "light": false,
+      "severity": "main",
+      "on_frames": 3,
+      "off_frames": 15,
+      "motion_pct": 1.2,
+      "alert_stage": "advance",
+      "rect": [
+        0.45,
+        0.285,
+        0.455,
+        0.205
+      ],
+      "ai_confirmation_window_s": 1.5,
+      "approach_motion": false,
+      "ai_context": true
+    },
+    {
+      "name": "Entrance waiting",
+      "polygon": [
+        [
+          0.665,
+          0.425
+        ],
+        [
+          0.75,
+          0.435
+        ],
+        [
+          0.83,
+          0.458
+        ],
+        [
+          0.875,
+          0.485
+        ],
+        [
+          0.875,
+          0.585
+        ],
+        [
+          0.665,
+          0.585
+        ]
+      ],
+      "classes": [
+        "car",
+        "motorcycle",
+        "bus",
+        "truck"
+      ],
+      "trigger": "ai",
+      "priority": true,
+      "route_group": "campus-entrance",
+      "route_role": "entrance",
+      "arrival_direction": null,
+      "ai_confirm_observations": 3,
+      "ai_confidence": 0.5,
+      "stationary_confirm_s": 3,
+      "motion": false,
+      "light": false,
+      "severity": "main",
+      "on_frames": 2,
+      "off_frames": 8,
+      "alert_stage": "barrier",
+      "rect": [
+        0.665,
+        0.425,
+        0.21,
+        0.16
+      ],
+      "confirmation_polygon": [
+        [
+          0.665,
+          0.48
+        ],
+        [
+          0.82,
+          0.48
+        ],
+        [
+          0.875,
+          0.525
+        ],
+        [
+          0.875,
+          0.585
+        ],
+        [
+          0.665,
+          0.585
+        ]
+      ],
+      "ai_fast_confirm_confidence": 0.6,
+      "ai_confirmation_window_s": 1.5
+    },
+    {
+      "name": "Pedestrian footpath",
+      "polygon": [
+        [
+          0.08,
+          0.56
+        ],
+        [
+          0.17,
+          0.535
+        ],
+        [
+          0.31,
+          0.525
+        ],
+        [
+          0.315,
+          0.4
+        ],
+        [
+          0.34,
+          0.355
+        ],
+        [
+          0.4,
+          0.335
+        ],
+        [
+          0.47,
+          0.36
+        ],
+        [
+          0.5,
+          0.4
+        ],
+        [
+          0.62,
+          0.405
+        ],
+        [
+          0.72,
+          0.405
+        ],
+        [
+          0.79,
+          0.425
+        ],
+        [
+          0.79,
+          0.505
+        ],
+        [
+          0.66,
+          0.5
+        ],
+        [
+          0.625,
+          0.5
+        ],
+        [
+          0.55,
+          0.525
+        ],
+        [
+          0.48,
+          0.535
+        ],
+        [
+          0.45,
+          0.56
+        ],
+        [
+          0.42,
+          0.6
+        ],
+        [
+          0.37,
+          0.64
+        ],
+        [
+          0.2,
+          0.665
+        ],
+        [
+          0.08,
+          0.675
+        ]
+      ],
+      "classes": [
+        "person"
+      ],
+      "trigger": "ai",
+      "motion": false,
+      "light": false,
+      "severity": "main",
+      "on_frames": 2,
+      "off_frames": 8,
+      "ai_confirm_observations": 3,
+      "ai_confidence": 0.6,
+      "route_role": "pedestrian",
+      "rect": [
+        0.08,
+        0.335,
+        0.71,
+        0.34
+      ]
+    }
+  ],
+  "alignment": {
+    "enabled": true,
+    "include_rects": [
+      [
+        0.0,
+        0.0,
+        1.0,
+        0.95
+      ]
+    ],
+    "exclude_rects": [
+      [
+        0.0,
+        0.0,
+        0.36,
+        0.11
+      ],
+      [
+        0.03,
+        0.64,
+        0.1,
+        0.17
+      ],
+      [
+        0.69,
+        0.8,
+        0.13,
+        0.1
+      ],
+      [
+        0.0,
+        0.87,
+        0.3,
+        0.08
+      ]
+    ],
+    "border_px": 0,
+    "light_scene_polygon": [
+      [
+        0.0,
+        0.12
+      ],
+      [
+        0.36,
+        0.12
+      ],
+      [
+        0.36,
+        0.0
+      ],
+      [
+        1.0,
+        0.0
+      ],
+      [
+        1.0,
+        0.95
+      ],
+      [
+        0.83,
+        0.95
+      ],
+      [
+        0.83,
+        0.79
+      ],
+      [
+        0.68,
+        0.79
+      ],
+      [
+        0.68,
+        0.95
+      ],
+      [
+        0.0,
+        0.95
+      ]
+    ],
+    "registration_exclude_rects": [
+      [
+        0.0,
+        0.0,
+        0.36,
+        0.11
+      ],
+      [
+        0.03,
+        0.64,
+        0.1,
+        0.17
+      ],
+      [
+        0.69,
+        0.8,
+        0.13,
+        0.1
+      ],
+      [
+        0.0,
+        0.87,
+        0.3,
+        0.08
+      ]
+    ],
+    "max_features": 1200,
+    "hold_s": 3,
+    "zoom_tolerance": 0.2
+  },
+  "power": {
+    "stop_when_camera_gone_s": 120
+  },
+  "presence": {
+    "enabled": false,
+    "checks_per_second": 4.0,
+    "watching_grace_s": 4.0,
+    "present_grace_s": 15.0,
+    "away_after_s": 30.0,
+    "drowsy_after_s": 10.0,
+    "asleep_after_s": 60.0,
+    "still_below": 0.06,
+    "floor": 0.25,
+    "escalate_unacked_s": 30.0,
+    "levels": {
+      "watching": [
+        0.3,
+        0.3,
+        0.0
+      ],
+      "present": [
+        0.45,
+        1.0,
+        12.0
+      ],
+      "away": [
+        0.3,
+        1.0,
+        18.0
+      ],
+      "unknown": [
+        0.3,
+        1.0,
+        18.0
+      ],
+      "drowsy": [
+        0.75,
+        1.0,
+        4.0
+      ],
+      "asleep": [
+        1.0,
+        1.0,
+        0.0
+      ]
+    },
+    "device_usb_id": "56cd:7890",
+    "device_index": 0
+  },
+  "alarms": {
+    "visit_quiet_s": 45,
+    "ack_quiet_s": 10,
+    "escalation": {
+      "confirmed": {
+        "rise_s": 10.0,
+        "level": 0.95,
+        "shape": 1.2
+      },
+      "urgent": {
+        "rise_s": 9.0,
+        "level": 0.88,
+        "shape": 1.2
+      },
+      "image": {
+        "rise_s": 9.0,
+        "level": 0.75,
+        "shape": 1.2
+      }
+    },
+    "start_level": 0.1,
+    "sound_theme": "low"
+  },
+  "barriers": {
+    "lines": {
+      "exit": {
+        "down": [
+          [
+            0.497,
+            0.439
+          ],
+          [
+            0.622,
+            0.452
+          ]
+        ],
+        "up": [
+          [
+            0.655,
+            0.13
+          ],
+          [
+            0.638,
+            0.44
+          ]
+        ]
+      },
+      "entrance": {
+        "down": [
+          [
+            0.668,
+            0.478
+          ],
+          [
+            0.84,
+            0.492
+          ]
+        ],
+        "up": [
+          [
+            0.656,
+            0.04
+          ],
+          [
+            0.656,
+            0.43
+          ]
+        ]
+      }
+    },
+    "ack_on_raise": true,
+    "ack_on_lower": true,
+    "reminder": true,
+    "reminder_after_s": 15.0,
+    "reminder_every_s": 15.0,
+    "display_geometry": {
+      "exit": {
+        "pivot": [
+          0.635,
+          0.452
+        ],
+        "down_tip": [
+          0.497,
+          0.439
+        ],
+        "up_tip": [
+          0.655,
+          0.13
+        ]
+      },
+      "entrance": {
+        "pivot": [
+          0.656,
+          0.474
+        ],
+        "down_tip": [
+          0.84,
+          0.492
+        ],
+        "up_tip": [
+          0.656,
+          0.04
+        ]
+      }
+    }
+  },
+  "ai": {
+    "interval_s": 0.25,
+    "entrance_verifier": true
+  },
+  "recordings": {
+    "keep": 100.0
+  },
+  "system": {
+    "name": "BarrierWatcher test fixture"
+  },
+  "view": "ptz2",
+  "_fixture_notice": "NON-DEPLOYABLE regression geometry and policy fixture. No image templates or camera source. Configure your own installation."
+}

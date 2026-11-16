@@ -9,7 +9,7 @@ warn() { printf '  \033[33m[WARN]\033[0m %s\n' "$1"; }
 die()  { printf '  \033[31m[FAIL]\033[0m %s\n' "$1"; exit 1; }
 
 echo; echo "c500-guard installer"; echo "===================="
-echo "  Full runbook: $ROOT/docs/c500-guard-runbook.pdf"
+echo "  Full runbook: $ROOT/docs/WINDOWS.md"
 echo "  Section 4 covers every error seen so far, with its fix."
 
 command -v python3 >/dev/null || die "python3 not found. Install Python 3.10+."
@@ -65,7 +65,7 @@ NEXT STEPS
   The Ctrl+Alt+F4 global hotkey is Windows-only.
 
 IF SOMETHING GOES WRONG
-  docs/c500-guard-runbook.pdf - section 4 is every known error and its fix.
+  docs/WINDOWS.md - setup and troubleshooting.
   The two that cost the most time:
     - Xiaomi login needs your NUMERIC Mi Account ID, not your email (error 70016)
     - Login can succeed and still list no devices if the region is wrong

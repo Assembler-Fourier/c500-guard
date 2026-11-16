@@ -3,11 +3,14 @@
 import copy
 import importlib.util
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
+import sys
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 spec = importlib.util.spec_from_file_location(
     "zone_editor", Path(__file__).resolve().parents[1] / "src" / "zone_editor.py")
 editor = importlib.util.module_from_spec(spec)
@@ -93,7 +96,94 @@ class ZoneEditorTests(unittest.TestCase):
         self.path.write_text(json.dumps(self.original), encoding="utf-8")
         html = editor.render_page(self.path)
         self.assertNotIn("</script><script>alert(1)</script>", html)
-        self.assertIn(r"\u003c/script>", html)
+        script_data = html.split('<script id="initial-config" type="application/json">', 1)[1].split('</script>', 1)[0]
+        self.assertNotIn('<', script_data)
+        self.assertEqual(json.loads(script_data)['zones'][0]['name'],
+                         self.original['zones'][0]['name'])
+
+    def test_polygon_class_filters_and_ignored_parking_round_trip(self):
+        zone = self.payload['zones'][0]
+        zone.update(polygon=[[.2, .3], [.6, .3], [.5, .5], [.3, .5]],
+                    classes=['car', 'truck'], trigger='ai',
+                    exclude_polygons=[[[.4, .4], [.6, .4], [.6, .5], [.4, .5]]])
+        result = editor.save_config(self.path, self.payload, armed=False)
+        self.assertEqual(result['zones'][0], zone)
+        self.assertEqual(editor.read_config(self.path), result)
+        self.assertEqual(result['_comment'], ['Keep me'])
+
+    def test_detailed_polygons_render_and_round_trip_without_simplification(self):
+        for count in (18, 21, 32):
+            with self.subTest(count=count):
+                points = [[.4 + .08 * math.cos(2 * math.pi * i / count),
+                           .4 + .08 * math.sin(2 * math.pi * i / count)]
+                          for i in range(count)]
+                original = copy.deepcopy(self.original)
+                zone = original['zones'][0]
+                zone.update(polygon=points, confirmation_polygon=points,
+                            light_polygon=points, exclude_polygons=[points])
+                self.path.write_text(json.dumps(original), encoding='utf-8')
+                before = self.path.read_bytes()
+                loaded = editor.read_config(self.path)
+                page = editor.render_page(self.path)
+                script_data = page.split(
+                    '<script id="initial-config" type="application/json">', 1
+                )[1].split('</script>', 1)[0]
+                self.assertEqual(json.loads(script_data)['zones'], original['zones'])
+                self.assertEqual(editor.save_config(
+                    self.path, {'zones': loaded['zones']}, armed=False), original)
+                self.assertEqual(editor.read_config(self.path), original)
+                self.assertTrue(any(p.read_bytes() == before
+                                    for p in self.path.parent.glob('zones.json.bak-*')))
+
+    def test_oversized_polygon_saves_leave_original_and_backups_unchanged(self):
+        points = [[.4 + .08 * math.cos(2 * math.pi * i / 33),
+                   .4 + .08 * math.sin(2 * math.pi * i / 33)] for i in range(33)]
+        before = self.path.read_bytes()
+        for field in ('polygon', 'confirmation_polygon', 'light_polygon', 'exclude_polygons'):
+            with self.subTest(field=field):
+                payload = copy.deepcopy(self.original)
+                payload['zones'][0][field] = [points] if field == 'exclude_polygons' else points
+                with self.assertRaisesRegex(ValueError, 'needs 3–32 corners'):
+                    editor.save_config(self.path, payload, armed=False)
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_bad_polygon_shapes_coordinates_and_bounds_are_rejected(self):
+        polygons = (
+            [], [[.2, .3], [.6, .3]],
+            [[.2, .3], [.6, .5], [.6, .3], [.2, .5]],
+            [[.2, .3], [.4, .3], [.6, .3]],
+            [[.2, .3], [.6, .3], [.6, float('nan')]],
+            [[.2, .3], [.6, .3], [.6, True]],
+            [[.2, .3], [.6, .3], [.7, .5]],  # Outside the bounding rectangle.
+            [[-.1, .3], [.6, .3], [.6, .5]],
+            'bad', None)
+        for polygon in polygons:
+            with self.subTest(polygon=polygon), self.assertRaises(ValueError):
+                payload = copy.deepcopy(self.original)
+                payload['zones'][0]['polygon'] = polygon
+                editor.validate_config(payload)
+
+    def test_invalid_class_filters_triggers_and_exclusions_are_rejected(self):
+        pairs = [('classes', 'person'), ('classes', ['person', 'person']),
+                 ('classes', ['unknown']), ('classes', [True]),
+                 ('classes', [[]]), ('classes', []), ('trigger', 'all'),
+                 ('exclude_polygons', None), ('exclude_polygons', ['bad']),
+                 ('exclude_polygons', [[]] * 17)]
+        for field, value in pairs:
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                payload = copy.deepcopy(self.original)
+                payload['zones'][0][field] = value
+                editor.validate_config(payload)
+        self.payload['zones'][0].update(trigger='motion', classes=[])
+        self.assertEqual(editor.validate_config(self.payload)['zones'][0]['classes'], [])
+
+    def test_rectangle_only_configuration_remains_unchanged(self):
+        result = editor.validate_config(self.original)
+        self.assertEqual(result['zones'], self.original['zones'])
+        self.assertNotIn('polygon', result['zones'][0])
+        self.assertNotIn('classes', result['zones'][0])
+        self.assertNotIn('trigger', result['zones'][0])
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ sessions, which it does on every reconnect.
 
 Point go2rtc at 127.0.0.1 and run this beside it:
 
-    lan_shim.py --camera 192.168.1.23
+    lan_shim.py --camera 192.0.2.23
 
 UDP payloads are forwarded unchanged. A TCP-ready response also records its
 actual camera endpoint so go2rtc can connect through the same loopback port
