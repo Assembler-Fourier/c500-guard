@@ -36,6 +36,14 @@ function element(tag, className, value) {
 function clock(seconds) {
   return `${Math.floor(seconds / 60).toString().padStart(2,'0')}:${Math.floor(seconds % 60).toString().padStart(2,'0')}`;
 }
+function controlLabel(id, key, markup) {
+  // Preserve button children between frames: replacing a pressed child before
+  // pointer-up can swallow a click even though the button itself survives.
+  const button = $(id);
+  if (button.dataset.displayState === key) return;
+  button.dataset.displayState = key;
+  button.innerHTML = markup;
+}
 function stopVoices() {
   for (const voice of voices) { try { voice.stop(); } catch { /* Already ended. */ } }
   voices.clear();
@@ -105,11 +113,11 @@ function updateUI(state) {
   const visible = state.objects.filter(object=>object.progress < 1);
   $('scene-objects').textContent = `${visible.length} TRACK${visible.length === 1?'':'S'}`;
   $('track-count').textContent = `${visible.length} TRACK${visible.length === 1?'':'S'}`;
-  $('pause').innerHTML = state.paused ? '▶ <span>Play</span>' : 'Ⅱ <span>Pause</span>';
+  controlLabel('pause', String(state.paused), state.paused ? '▶ <span>Play</span>' : 'Ⅱ <span>Pause</span>');
   $('pause').setAttribute('aria-label',state.paused?'Play simulation':'Pause simulation');
   $('speed').textContent = `${state.speed}×`;
   $('speed').setAttribute('aria-label',`Playback speed: ${state.speed} times`);
-  $('lighting').innerHTML = state.lighting === 'night' ? '☾ <span>Night</span>' : '☼ <span>Day</span>';
+  controlLabel('lighting', state.lighting, state.lighting === 'night' ? '☾ <span>Night</span>' : '☼ <span>Day</span>');
   $('lighting').setAttribute('aria-label',state.lighting === 'night'?'Switch to day view':'Switch to night view');
   const quiet = state.quietRemaining > .01;
   $('status-card').dataset.state = state.alarm ? 'alert' : quiet ? 'quiet' : 'watching';
