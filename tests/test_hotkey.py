@@ -585,3 +585,104 @@ class HotkeyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(sys.platform.startswith("win"), "Windows ctypes ABI tests")
+class EasyKeyTests(unittest.TestCase):
+    """` pauses/resumes and . pauses, from any app, while still typing. Shares HotkeyTests' mocked setup."""
+    press = HotkeyTests.press
+    tearDown = HotkeyTests.tearDown
+    cache_alarm = HotkeyTests.cache_alarm
+    PASS = 0x123456789ABC                                          # CallNextHookEx: the key reaches the app
+
+    def setUp(self):
+        HotkeyTests.setUp(self)
+        self.user32.GetAsyncKeyState.return_value = 0          # no modifier held
+
+    def use(self, scan, vk):
+        self.key.scanCode, self.key.vkCode, self.key.flags = scan, vk, 0
+
+    def test_backtick_toggles_and_still_types(self):
+        self.use(hk.SC_PAUSE_KEY, 0xDF)
+        with patch.object(hk.time, "monotonic", return_value=5.):
+            self.assertEqual(self.press(hk.WM_KEYDOWN), self.PASS)
+            self.assertEqual(self.press(hk.WM_KEYDOWN), self.PASS)              # held: repeats type, act once
+            self.assertEqual(self.press(hk.WM_KEYUP), self.PASS)
+        self.assertEqual(self.hotkey._requests.get_nowait(), "toggle")
+        self.assertTrue(self.hotkey._requests.empty())
+
+    def test_full_stop_pauses_and_still_types(self):
+        self.use(hk.SC_DOT_KEY, 0xBE)
+        self.assertEqual(self.press(hk.WM_KEYDOWN), self.PASS)
+        self.assertEqual(self.hotkey._requests.get_nowait(), "pause")
+
+    def test_number_pad_dot_pauses_but_the_delete_key_does_not(self):
+        self.use(hk.SC_NUMPAD_DOT, 0x6E)
+        self.assertEqual(self.press(hk.WM_KEYDOWN), self.PASS)
+        self.assertEqual(self.hotkey._requests.get_nowait(), "pause")
+        self.hotkey._pending.clear(); self.press(hk.WM_KEYUP)
+        self.use(hk.SC_NUMPAD_DOT, 0x2E)
+        self.key.flags = hk.LLKHF_EXTENDED                                     # the separate Delete key
+        with patch.object(hk.time, "monotonic", return_value=99.):
+            self.press(hk.WM_KEYDOWN)
+        self.assertTrue(self.hotkey._requests.empty())
+
+    def test_with_a_modifier_it_is_an_ordinary_key(self):
+        self.user32.GetAsyncKeyState.side_effect = lambda vk: 0x8000 if vk == hk.VK_SHIFT else 0
+        for scan, vk in ((hk.SC_DOT_KEY, 0xBE), (hk.SC_PAUSE_KEY, 0xDF)):
+            self.use(scan, vk)
+            self.assertEqual(self.press(hk.WM_KEYDOWN), self.PASS)
+            self.press(hk.WM_KEYUP)
+        self.assertTrue(self.hotkey._requests.empty())
+
+    def test_quick_presses_collapse_and_a_later_one_acts_again(self):
+        self.use(hk.SC_DOT_KEY, 0xBE)
+        clock = {"now": 1.}
+        with patch.object(hk.time, "monotonic", side_effect=lambda: clock["now"]):
+            self.press(hk.WM_KEYDOWN); self.press(hk.WM_KEYUP)
+            clock["now"] = 1.2
+            self.press(hk.WM_KEYDOWN); self.press(hk.WM_KEYUP)                   # 0.2 s later: collapsed
+            self.assertEqual(self.hotkey._requests.qsize(), 1)
+            self.hotkey._requests.get_nowait(); self.hotkey._pending.clear()
+            clock["now"] = 9.
+            self.press(hk.WM_KEYDOWN); self.press(hk.WM_KEYUP)
+        self.assertEqual(self.hotkey._requests.get_nowait(), "pause")
+
+    def test_injected_extended_and_other_keys_do_nothing(self):
+        self.use(hk.SC_DOT_KEY, 0xBE)
+        self.key.flags = hk.LLKHF_INJECTED
+        self.press(hk.WM_KEYDOWN)
+        self.key.flags = hk.LLKHF_EXTENDED
+        self.press(hk.WM_KEYDOWN)
+        self.use(0x1E, 0x41)                                                   # "a"
+        self.press(hk.WM_KEYDOWN)
+        self.assertTrue(self.hotkey._requests.empty())
+
+    def test_full_stop_still_acknowledges_a_sounding_alarm(self):
+        self.cache_alarm()
+        self.use(hk.SC_DOT_KEY, 0xBE)
+        self.assertEqual(self.press(hk.WM_KEYDOWN), self.PASS)
+        self.assertEqual(self.hotkey._ack_requests.get_nowait()[:2], ("alarm-a", "input-any-key"))
+        self.assertEqual(self.hotkey._requests.get_nowait(), "pause")
+
+    def test_pause_posts_disarm_and_never_arms(self):
+        response = MagicMock()
+        response.__enter__.return_value = io.BytesIO(json.dumps({"armed": False}).encode())
+        with patch.object(hk.urllib.request, "urlopen", return_value=response) as http, \
+                patch.object(self.hotkey, "beep") as beep, patch.object(self.hotkey, "say"):
+            self.hotkey.pause()
+        request = http.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/disarm"))
+        self.assertEqual(request.get_method(), "POST")
+        beep.assert_called_once_with(False)
+
+    def test_worker_routes_pause_and_toggle(self):
+        with patch.object(self.hotkey, "pause") as pause, patch.object(self.hotkey, "toggle") as toggle:
+            self.hotkey._worker.start() if not self.hotkey._worker.is_alive() else None
+            self.hotkey._requests.put("pause")
+            self.hotkey._requests.join()
+            self.hotkey._requests.put(True)
+            self.hotkey._requests.join()
+        pause.assert_called_once()
+        toggle.assert_called_once()
+

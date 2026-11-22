@@ -31,7 +31,7 @@ const icon=name=>`<svg data-icon="${name}"></svg>`,routeRole=zone=>zone.route_ro
 const navigate=page=>navigated=page,editor={selectRoute:role=>selected=role},highlightRoute=()=>{};
 function button(dataset){return {dataset,listeners:{},addEventListener(name,fn){this.listeners[name]=fn}}}
 const document={querySelectorAll(selector){
- if(selector==='.route-card')return buttons=[...html.matchAll(/data-route="([a-z]+)"/g)].map(m=>button({route:m[1]}));
+ if(selector==='.lane-top')return buttons=[...html.matchAll(/data-route="([a-z]+)"/g)].map(m=>button({route:m[1]}));
  if(selector==='[data-lane-sound]')return sounds=[...html.matchAll(/data-lane-sound="([a-z]+)"/g)].map(m=>{const b=button({laneSound:m[1]});nodes.set('hear-'+m[1],b);return b});
  return [];
 }};
@@ -45,32 +45,42 @@ const healthy={cameraFresh:true,aligned:true,aiFresh:true};
         self.js(self.routes_harness() + r"""
 renderRoutes(current,healthy);
 assert.deepEqual(buttons.map(b=>b.dataset.route),['entrance','exit','pedestrian']);
-assert.deepEqual(sounds.map(b=>b.dataset.laneSound),['entrance','exit']);
 const cards=[...html.matchAll(/<article.*?<\/article>/gs)].map(m=>m[0]);
-assert.match(cards[0],/Entrance/);assert.equal($('lane-entrance-arm').textContent,'UP');assert.match(cards[0],/Rising tones/);
-assert.match(cards[1],/Exit/);assert.equal($('lane-exit-arm').textContent,'DOWN');assert.match(cards[1],/Falling tones/);
-assert.match(cards[2],/Footpath/);assert.doesNotMatch(cards[2],/lane-barrier|data-lane-sound|<strong>(?:UP|DOWN)<\/strong>/);
-buttons[1].listeners.click();assert.equal(navigated,'zones');assert.equal(selected,'exit');
-await sounds[0].listeners.click();await sounds[1].listeners.click();
-assert.deepEqual(calls,[['test-tone',{lane:'entrance'}],['test-tone',{lane:'exit'}]]);
+assert.match(cards[0],/Entrance/);assert.equal($('lane-entrance-arm').textContent,'UP');
+assert.match(cards[1],/Exit/);assert.equal($('lane-exit-arm').textContent,'DOWN');
+assert.match(cards[2],/Footpath/);assert.doesNotMatch(cards[2],/lane-pedestrian-arm|data-lane-sound/);
+buttons[1].listeners.click();assert.equal(navigated,'setup');assert.equal(selected,'exit');
+assert.equal($('hear-entrance').disabled,false);assert.equal($('hear-exit').disabled,false);
 """)
+
+    def test_barrier_rows_open_barrier_setup_and_ask_for_it_only_when_unknown(self):
+        self.js(self.routes_harness() + r"""
+renderRoutes(current,healthy);
+assert.equal((html.match(/class="lane-barrier-link"/g)||[]).length,2,'Entrance and exit rows open barrier setup');
+assert.equal((html.match(/data-bell="/g)||[]).length,2,'Entrance and exit rows carry the barrier-up reminder switch');
+assert.equal($('lane-entrance-setup').hidden,true);assert.equal($('lane-exit-setup').hidden,true);
+const unknown=structuredClone(current);unknown.barriers.barriers[1].fresh=false;renderRoutes(unknown,healthy);
+assert.equal($('lane-entrance-arm').textContent,'UNKNOWN');assert.equal($('lane-entrance-setup').hidden,false);
+assert.equal($('lane-exit-setup').hidden,true);
+""")
+        self.assertIn("document.querySelectorAll('.lane-barrier-link').forEach(button=>button.addEventListener('click',()=>navigate('setup','barriers')));", self.page)
+        self.assertIn('data-go="setup" data-setup="barriers"', self.page)
 
     def test_stale_and_preview_panels_never_reuse_memory_as_current_position(self):
         self.js(self.routes_harness() + r"""
 current.barriers.memory={exit:{state:'up',seen_ago_s:1,for_s:100},entrance:{state:'down',seen_ago_s:1}};
-for(const condition of ['state','picture','disconnected','unaligned','preview','raw']){
+for(const condition of ['state','picture','disconnected','unaligned','raw']){
  now=1000;lastStateAt=lastFrameAt=1000;connectionOk=true;mode='live';renderedRoutes='';
  let status={...healthy},state=structuredClone(current);
  if(condition==='state')now=2800;
  if(condition==='picture')lastFrameAt=-4000;
  if(condition==='disconnected')connectionOk=false;
  if(condition==='unaligned')status.aligned=false;
- if(condition==='preview')mode='alarm';
  if(condition==='raw')state.barriers.barriers.forEach(arm=>arm.fresh=false);
  renderRoutes(state,status);
- assert.equal($('lane-entrance-arm').textContent,'Unknown',condition);
- assert.equal($('lane-exit-arm').textContent,'Unknown',condition);
- if(['state','disconnected','preview'].includes(condition)){
+ assert.equal($('lane-entrance-arm').textContent,'UNKNOWN',condition);
+ assert.equal($('lane-exit-arm').textContent,'UNKNOWN',condition);
+ if(['state','disconnected'].includes(condition)){
   assert.equal($('hear-entrance').disabled,true,condition);assert.equal($('hear-exit').disabled,true,condition);
   for(const role of ['entrance','exit','pedestrian'])assert.doesNotMatch($(`lane-${role}-indicator`).className,/healthy/,condition);
  }
@@ -86,10 +96,10 @@ const performance={now:()=>now},finite=Number.isFinite,render=()=>{},toast=()=>{
 const calls=[],transport={command:async(...args)=>{calls.push(args);return {ok:true}}};
 """ + command + hear + r"""
 await hearLane('exit');assert.deepEqual(calls,[['test-tone',{lane:'exit'}]]);
-for(const reason of ['stale','busy','offline','shutdown','preview','notlive','invalid']){
+for(const reason of ['stale','busy','offline','shutdown','preview','invalid']){
  now=1000;commandBusy=false;connectionOk=true;shutdownRequested=false;production=true;mode='live';
  if(reason==='stale')now=2800;if(reason==='busy')commandBusy=true;if(reason==='offline')connectionOk=false;
- if(reason==='shutdown')shutdownRequested=true;if(reason==='preview')production=false;if(reason==='notlive')mode='alarm';
+ if(reason==='shutdown')shutdownRequested=true;if(reason==='preview')production=false;
  await hearLane(reason==='invalid'?'pedestrian':'entrance');assert.equal(calls.length,1,reason);
 }
 """)
@@ -172,7 +182,7 @@ const source={complete:true,naturalWidth:640,naturalHeight:360};
 const $=id=>id==='feed'?source:id.endsWith('-label')?label:canvas;
 const arm={id:'exit',name:'Exit',inspectionBox:box};
 renderBarrierInspection(arm,true);assert.equal(canvas.hidden,false);assert.equal(draws.length,1);assert.equal(draws[0][0],source);
-assert.match(label.textContent,/Exit arm · inspection crop/);assert.equal('src' in source,false);
+assert.match(label.textContent,/Exit arm · close-up/);assert.equal('src' in source,false);
 renderBarrierInspection(arm,false);assert.equal(canvas.hidden,true);assert.equal(draws.length,1);
 renderBarrierInspection({...arm,inspectionBox:null},true);assert.equal(canvas.hidden,true);assert.equal(draws.length,1);
 source.complete=false;renderBarrierInspection(arm,true);assert.equal(canvas.hidden,true);assert.equal(draws.length,1);
@@ -190,7 +200,7 @@ assert.match(box.className,/held/);assert.doesNotMatch(box.className,/good/);
 assert.equal(box.children[1].children.length,2);assert.doesNotMatch(box.children[1].children[1].textContent,/97|framing|%/);
 """)
 
-    def test_framing_coach_only_exists_on_system_page_and_warnings_do_not_cover_picture(self):
+    def test_framing_coach_only_exists_in_camera_setup_and_warnings_do_not_cover_picture(self):
         class Structure(HTMLParser):
             def __init__(self):
                 super().__init__(); self.stack=[]; self.ancestors={}
@@ -205,14 +215,13 @@ assert.equal(box.children[1].children.length,2);assert.doesNotMatch(box.children
                     if self.stack[index][0]==tag:
                         del self.stack[index:];break
         parsed=Structure();parsed.feed(self.page)
-        self.assertIn('page-system',parsed.ancestors['framing-coach'])
-        self.assertNotIn('page-monitor',parsed.ancestors['framing-coach'])
+        self.assertIn('setup-camera',parsed.ancestors['framing-coach'])
+        self.assertNotIn('page-live',parsed.ancestors['framing-coach'])
         self.assertNotIn('camera-stage',parsed.ancestors['camera-warning'])
         for lane in ('entrance','exit'):
-            self.assertIn('barrier-drawer',parsed.ancestors[f'barrier-{lane}-inspection'])
+            self.assertIn('setup-barriers',parsed.ancestors[f'barrier-{lane}-inspection'])
         self.assertIn('this lane’s arm reaching UP or DOWN',self.page)
         self.assertNotIn('moving either arm (up or down)',self.page)
-
 
 if __name__=='__main__':
     unittest.main()

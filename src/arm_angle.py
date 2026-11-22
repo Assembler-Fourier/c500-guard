@@ -119,6 +119,76 @@ def refine_geometry(geometry: dict, down_frame=None, up_frame=None, reach: int =
     return best
 
 
+def display_barrier_row(row: dict, reading: dict | None, geometry: dict | None, *,
+                        reading_fresh: bool = False, width: int = 640, height: int = 360) -> dict:
+    """Resolve presentation only; never change recognition or movement evidence.
+
+    Recognition strips deliberately sample only part of an arm and may extend
+    into its background. They are not display geometry. A transient angle
+    failure must not switch a settled arm back to those different endpoints.
+    Unknown remains unknown; only a fresh measured movement may supply its
+    provisional line. The caller still owns all alarm/acknowledgement rules.
+    """
+    result = {**row, 'active_line': None, 'live_line': None,
+              'live_angle': None, 'live_motion': None}
+    reading = reading if isinstance(reading, dict) else {}
+
+    def valid_line(line):
+        if not isinstance(line, (list, tuple)) or len(line) != 2:
+            return False
+        try:
+            values = np.asarray(line, dtype=float)
+            return (values.shape == (2, 2) and np.isfinite(values).all()
+                    and np.all((values >= 0) & (values <= 1))
+                    and np.linalg.norm(values[1]-values[0]) > .001)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    fresh = row.get('fresh') is True and row.get('calibrated') is True
+    known = fresh and row.get('state') in ('up', 'down')
+    conflict = reading_fresh and reading.get('position_conflict') is True
+    if conflict:
+        if row.get('state') in ('up', 'down'):
+            # Preserve the raw classifier claim for diagnostics even when it
+            # lacks fresh calibration proof; the presented state stays Unknown.
+            result['classifier_state'] = row['state']
+        result.update(state='unknown', confidence=0., candidate_position=None,
+                      reason='Arm angle disagrees with calibrated position')
+        return result
+    if known:
+        theta = 0. if row['state'] == 'down' else 90.
+        line = None
+        if geometry is not None:
+            try:
+                scale = np.asarray((width, height), dtype=float)
+                points = np.asarray([geometry['down_tip' if theta == 0 else 'up_tip'],
+                                     geometry['pivot']], dtype=float)
+                if scale.shape != (2,) or not np.isfinite(scale).all() or np.any(scale <= 0):
+                    raise ValueError('Invalid display dimensions')
+                if points.shape != (2, 2) or not np.isfinite(points).all():
+                    raise ValueError('Invalid display geometry')
+                candidate = np.round(points / scale, 4).tolist()
+                if valid_line(candidate):
+                    line = candidate
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass  # Invalid configured geometry never borrows sampling strips.
+        elif valid_line(row.get('active_line')):
+            # Legacy callers without display geometry retain their endpoint.
+            line = [list(point) for point in row['active_line']]
+        result.update(active_line=line, live_line=line, live_angle=theta if line else None)
+        return result
+    result.update(state='unknown', confidence=0., candidate_position=None)
+    if (fresh and reading_fresh and reading.get('ok') is True
+            and reading.get('motion') in ('rising', 'lowering')
+            and valid_line(reading.get('line'))):
+        shown = reading.get('shown', reading.get('theta'))
+        if (not isinstance(shown, bool) and isinstance(shown, (int, float))
+                and math.isfinite(shown) and 0 <= shown <= 90):
+            result.update(live_line=[list(point) for point in reading['line']],
+                          live_angle=shown, live_motion=reading['motion'])
+    return result
+
+
 class ArmAngleTracker:
     """Live angle per arm, whether the reading can be trusted, and whether the arm is rising or lowering."""
 

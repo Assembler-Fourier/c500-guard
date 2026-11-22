@@ -246,14 +246,18 @@ class EarlyAckTests(unittest.TestCase):
     def test_live_line_is_published_while_fresh(self):
         self.obj.barrier_workflow = mock.Mock()
         self.obj.barrier_workflow.status.return_value = {"configured": True, "barriers": [
-            {"id": "exit", "state": "unknown"}, {"id": "entrance", "state": "down"}]}
+            {"id": "exit", "state": "unknown", "fresh": True, "calibrated": True},
+            {"id": "entrance", "state": "down", "fresh": True, "calibrated": True}]}
         self.obj._arm_live = {"exit": {"line": [[.4, .1], [.54, .22]], "theta": 45., "motion": "rising",
-                                       "at_wall": time.time()}}
+                                       "ok": True, "at_wall": time.time()}}
         rows = {r["id"]: r for r in self.obj.barrier_status()["barriers"]}
         self.assertEqual([[.4, .1], [.54, .22]], rows["exit"]["live_line"])
-        self.assertNotIn("live_line", rows["entrance"])
+        geometry = self.obj._arm_tracker.geometry['entrance']
+        expected = [[round(float(p[0])/watch.PROC_W, 4), round(float(p[1])/watch.PROC_H, 4)]
+                    for p in (geometry['down_tip'], geometry['pivot'])]
+        self.assertEqual(expected, rows["entrance"]["live_line"])
         self.obj._arm_live["exit"]["at_wall"] -= 5
-        self.assertNotIn("live_line", {r["id"]: r for r in self.obj.barrier_status()["barriers"]}["exit"])
+        self.assertIsNone({r["id"]: r for r in self.obj.barrier_status()["barriers"]}["exit"]["live_line"])
 
 
 class FirstLoadGraceTests(unittest.TestCase):

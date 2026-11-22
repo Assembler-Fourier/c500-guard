@@ -38,16 +38,14 @@ renderFraming(adjust,{cameraFresh:true,aligned:false});assert.equal(box.hidden,f
 shutdownRequested=true;renderFraming(adjust,status);assert.equal(box.hidden,true);
 """)
 
-    def test_good_banner_gets_a_fresh_display_period_after_signal_recovers(self):
+    def test_good_banner_follows_signal_loss_and_recovery(self):
+        # The framing advice lives on Setup > Camera, where a good result stays visible while it is current.
         self.js(self.framing_harness() + """
 renderFraming(good,status);assert.equal(box.hidden,false);
-now=17000;lastStateAt=lastFrameAt=now;renderFraming(good,status);assert.equal(box.hidden,true);
+now=17000;lastStateAt=lastFrameAt=now;renderFraming(good,status);assert.equal(box.hidden,false);
 renderFraming({},status);assert.equal(box.hidden,true);
-now=18000;lastStateAt=lastFrameAt=now;renderFraming(good,status);
-assert.equal(box.hidden,false,'Newly recovered advice must get its full display period');
-now=34000;lastStateAt=lastFrameAt=now;renderFraming(good,status);assert.equal(box.hidden,true);
-mode='paused';renderFraming(good,status);assert.equal(box.hidden,true);
-mode='live';renderFraming(good,status);assert.equal(box.hidden,false);
+connectionOk=false;renderFraming(good,status);assert.equal(box.hidden,true,'No cached advice while disconnected');
+connectionOk=true;now=18000;lastStateAt=lastFrameAt=now;renderFraming(good,status);assert.equal(box.hidden,false);
 """)
 
     def test_camera_label_uses_the_current_view_and_never_an_anpr_constant(self):
@@ -65,7 +63,6 @@ assert.equal(cameraViewLabel({},fresh),'Camera view unconfirmed');
 connectionOk=false;assert.equal(cameraViewLabel({camera_view:'PTZ 2'},fresh),'Camera view unconfirmed');
 connectionOk=true;now=2800;assert.equal(cameraViewLabel({camera_view:'PTZ 2'},fresh),'Camera view unconfirmed');
 lastStateAt=now;assert.equal(cameraViewLabel({camera_view:'PTZ 2'},{cameraFresh:false}),'Camera view unconfirmed');
-mode='alarm';assert.equal(cameraViewLabel({camera_view:'PTZ 2'},fresh),'Preview camera');
 """)
 
 

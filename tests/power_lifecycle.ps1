@@ -153,6 +153,20 @@ try {
     $healthy.ml.available=$true; $healthy.loop_age_s=30
     Assert (-not (Test-StartupHealth $healthy)) 'Answering API with stalled detector is not healthy.'
     Assert (-not (Test-StartupHealth ([pscustomobject]@{frames=4}))) 'Incomplete API shape must fail closed.'
+    $healthy.loop_age_s=0.1
+    Assert ((Get-StartupProblem $null) -like '*did not answer*') 'No answer is named.'
+    Assert ((Get-StartupProblem ([pscustomobject]@{frames=4})) -like '*incomplete*') 'A partial status is named.'
+    $healthy.alignment.state='keyboard_menu'
+    Assert ((Get-StartupProblem $healthy) -like '*Live View menu bar*') 'The keyboard menu is named.'
+    $healthy.alignment.state='calibration_required'
+    Assert ((Get-StartupProblem $healthy) -like '*does not match a saved view*') 'A wrong view is named.'
+    $healthy.alignment.state='tracking'; $healthy.ml.state='retrying'
+    Assert ((Get-StartupProblem $healthy) -like '*AI did not*') 'An AI problem is named.'
+    $healthy.ml.state='ready'; $healthy.input_helper.connected=$false
+    Assert ((Get-StartupProblem $healthy) -like '*helper*') 'The input helper is named.'
+    $healthy.input_helper.connected=$true; $healthy.last_frame_age=9
+    Assert ((Get-StartupProblem $healthy) -like '*no camera picture*') 'A missing picture is named first.'
+    $healthy.last_frame_age=0.2
     $script:taskRows[0].Actions[0].Arguments='"C:\Other\service.py"'
     Assert-Throws { Get-OwnedTasks } 'Task-name-only ownership must be rejected.'
     $script:taskRows[0]=New-Worker 'c500-guard service' 'service.py'

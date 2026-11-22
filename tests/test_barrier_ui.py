@@ -33,8 +33,8 @@ class BarrierUiTests(unittest.TestCase):
         cls.helpers = cls.page.split("// BARRIER_STATE_HELPERS_START", 1)[1].split(
             "// BARRIER_STATE_HELPERS_END", 1
         )[0]
-        cls.drawer = cls.page.split("// BARRIER_DRAWER_START", 1)[1].split(
-            "$('open-barriers').addEventListener", 1
+        cls.drawer = cls.page.split("// BARRIER_SETUP_START", 1)[1].split(
+            "document.querySelectorAll('[data-barrier-action]')", 1
         )[0]
         start = cls.page.index("function createTransport(")
         end = cls.page.index("return {path,read,command};", start)
@@ -154,15 +154,12 @@ for(const modeKey of ['picture','alignment','connection','stateage','shutdown','
 }
 """)
 
-    def test_drawer_does_not_add_camera_requests_or_polling(self):
-        body = self.page.split("// BARRIER_DRAWER_START", 1)[1].split("// BARRIER_DRAWER_END", 1)[0]
+    def test_barrier_tab_does_not_add_camera_requests_or_polling(self):
+        body = self.page.split("// BARRIER_SETUP_START", 1)[1].split("// BARRIER_SETUP_END", 1)[0]
         self.assertNotRegex(body, r"\b(?:fetch|setInterval|setTimeout|readState|readFrame)\(")
         self.assertIn("$('barrier-capture-image').src=displayedFrame", body)
         self.assertIn("performance.now()-lastStateAt<1800", body)
-        self.assertIn("barrierReturnFocus.focus()", body)
-        self.assertIn("event.key!=='Tab'", body)
-        self.assertIn("showModal()", body)
-        self.assertIn("window.addEventListener('pagehide'", body)
+        self.assertIn("setupVisible('barriers')", body)      # the shared picture is only copied while the tab shows
 
     def test_calibration_markup_has_distinct_labeled_controls(self):
         class Collector(HTMLParser):
@@ -171,14 +168,14 @@ for(const modeKey of ['picture','alignment','connection','stateage','shutdown','
                 self.ids = {}
             def handle_starttag(self, tag, attrs):
                 attrs = dict(attrs)
-                if attrs.get("id", "").startswith(("barrier-", "capture-", "reset-", "open-barriers", "close-barriers")):
+                if attrs.get("id", "").startswith(("barrier-", "capture-", "reset-", "setup-barriers")):
                     self.ids.setdefault(attrs["id"], []).append((tag, attrs))
         collector = Collector()
         collector.feed(self.page)
         self.assertTrue(all(len(nodes) == 1 for nodes in collector.ids.values()))
-        tag, attrs = collector.ids["barrier-drawer"][0]
-        self.assertEqual(tag, "dialog")
-        self.assertEqual(attrs["aria-labelledby"], "barrier-title")
+        tag, attrs = collector.ids["setup-barriers"][0]
+        self.assertEqual(tag, "section")
+        self.assertEqual(attrs["role"], "tabpanel")
         for arm in ("exit", "entrance"):
             for position in ("up", "down"):
                 _, button = collector.ids[f"capture-{arm}-{position}"][0]

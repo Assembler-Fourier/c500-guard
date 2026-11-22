@@ -19,6 +19,7 @@ class FakeEncoder:
         self.target = Path(command[-1])
         self.parts = []
         self.returncode = None
+        self.stderr = None
         self.stdin = type('Sink', (), {'write': lambda _s, value: self.parts.append(value),
                                       'close': lambda _s: None})()
 

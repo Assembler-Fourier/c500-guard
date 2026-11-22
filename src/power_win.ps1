@@ -112,8 +112,10 @@ function Stop-Workers {
         Stop-ScheduledTask -InputObject $task -ErrorAction Stop
     }
 }
-function Invoke-ProcessCheck([string]$Mode) {
-    $raw = & $Python (Join-Path $PSScriptRoot 'power_processes.py') $Mode --root $Repo
+function Invoke-ProcessCheck([string]$Mode, [switch]$KeepLauncher) {
+    # A failed start keeps the app launcher: its window explains why and offers Try again.
+    $extra = @(); if ($KeepLauncher) { $extra = @('--keep-launcher') }
+    $raw = & $Python (Join-Path $PSScriptRoot 'power_processes.py') $Mode --root $Repo @extra
     $code = $LASTEXITCODE
     try { $result = ($raw | Out-String) | ConvertFrom-Json -ErrorAction Stop }
     catch { throw 'The guarded process inventory did not return a valid result.' }
@@ -149,7 +151,8 @@ function Invoke-QuietDisarm {
     } catch { } # A stopped watcher is expected; guarded cleanup is authoritative.
 }
 function Get-StopVerification {
-    $after = Invoke-ProcessCheck 'inventory'
+    param([switch]$KeepLauncher)
+    $after = Invoke-ProcessCheck 'inventory' -KeepLauncher:$KeepLauncher
     $Receipt.remaining_processes = @($after.owned)
     $Receipt.unverified_processes = @($after.unverified)
     $Receipt.listening_ports = @(Get-C500Listeners)
@@ -183,6 +186,29 @@ function Test-StartupHealth {
             $null -ne $Status.loop_age_s -and $Status.loop_age_s -lt 5
     } catch { return $false }
 }
+function Get-StartupProblem {
+    param($Status)
+    # Plain words for the receipt and the app's "Did not start" message: the first condition that failed.
+    if ($null -eq $Status) { return 'the alarm engine did not answer' }
+    try {
+        if (-not ($Status.frames -gt 0) -or $null -eq $Status.last_frame_age -or $Status.last_frame_age -ge 3) {
+            return 'no camera picture: check the capture stick and that the keyboard is switched on'
+        }
+        $alignment = [string]$Status.alignment.state
+        if ($alignment -eq 'keyboard_menu') {
+            return "the keyboard's Live View menu bar is across the camera picture: make the camera full-screen on the keyboard"
+        }
+        if ($alignment -notin @('tracking','holding','disabled')) {
+            return 'the camera picture does not match a saved view: show ANPR Entrance or PTZ 2 full-screen on the keyboard'
+        }
+        if (-not $Status.ml.available -or $Status.ml.state -ne 'ready' -or -not ($Status.ml.inferences -gt 0)) {
+            return 'the AI did not become ready'
+        }
+        if (-not $Status.input_helper.connected) { return 'the key/click helper did not connect' }
+        if ($null -eq $Status.loop_age_s -or $Status.loop_age_s -ge 5) { return 'the detector loop stalled' }
+    } catch { return 'the alarm engine answered with an incomplete status' }
+    return 'it was not fully healthy in time'
+}
 function Start-Workers {
     $workers = @(Get-OwnedTasks | Where-Object { $_.TaskName -in @('c500-guard service','c500-guard hotkey') })
     if ($workers.Count -ne 2) { throw 'The installed supervisor or input-helper task is missing.' }
@@ -199,6 +225,7 @@ function Start-Workers {
     }
 }
 function Stop-FullStack {
+    param([switch]$KeepLauncher)
     if (-not (Test-Path -LiteralPath $Marker)) { Write-OffRequest }
     # Give the watcher a bounded chance to silence the alarm and restore the
     # saved speaker volume before terminating its task/process tree. A watcher
@@ -208,12 +235,12 @@ function Stop-FullStack {
     # binaries. Do not trust PID files alone.
     try { Stop-Workers } catch { $Receipt.errors += $_.Exception.Message }
     try {
-        $stopped = Invoke-ProcessCheck 'stop'
+        $stopped = Invoke-ProcessCheck 'stop' -KeepLauncher:$KeepLauncher
         $Receipt.stopped_processes = @($stopped.stopped)
         foreach ($problem in @($stopped.errors)) { $Receipt.errors += $problem.error }
     } catch { $Receipt.errors += $_.Exception.Message }
     Start-Sleep -Milliseconds 350
-    $verified = Get-StopVerification
+    $verified = Get-StopVerification -KeepLauncher:$KeepLauncher
     $Receipt.ok = $Receipt.errors.Count -eq 0 -and $verified
     $Receipt.power_state = if ($Receipt.ok) {'off'} else {'error'}
     if (-not $Receipt.ok -and $Receipt.errors.Count -eq 0) {
@@ -271,18 +298,23 @@ try {
         if (Test-Path -LiteralPath $Paused) { Remove-Item -LiteralPath $Paused -Force }
         Start-Workers
         $ready = $false
+        $lastStatus = $null
         $deadline = [DateTime]::UtcNow.AddSeconds(75)
         while ([DateTime]::UtcNow -lt $deadline) {
             Assert-OnAllowed
             try {
                 $status = Invoke-RestMethod -Uri 'http://127.0.0.1:8787/state' -TimeoutSec 2 -ErrorAction Stop
+                $lastStatus = $status
                 $ready = Test-StartupHealth $status
                 if ($ready) { break }
             } catch { $ready = $false }
             Start-Sleep -Milliseconds 500
         }
         Assert-OnAllowed
-        if (-not $ready) { throw 'Camera, AI and input helper did not become healthy within 75 seconds.' }
+        if (-not $ready) {
+            throw ('Camera, AI and input helper did not become healthy within 75 seconds: ' +
+                   (Get-StartupProblem $lastStatus) + '.')
+        }
         $armed = Invoke-RestMethod -Uri 'http://127.0.0.1:8787/arm' -Method Post -Headers @{'X-Via'='ctl'} -TimeoutSec 3
         Assert-OnAllowed
         if (-not $armed.armed) { throw 'The watcher did not confirm alerts armed.' }
@@ -311,8 +343,9 @@ try {
     $Receipt.errors += $_.Exception.Message
     $Receipt.ok = $false; $Receipt.power_state = 'error'
     if ($TransitionLock -and $Action -eq 'On') {
-        # Partial startup must not leave a hook or camera process behind.
-        try { Stop-FullStack } catch { $Receipt.errors += $_.Exception.Message }
+        # Partial startup must not leave a hook or camera process behind. The app launcher stays so it can
+        # show why the start failed and offer Try again (21 Nov 2026: it was stopped and the window just vanished).
+        try { Stop-FullStack -KeepLauncher } catch { $Receipt.errors += $_.Exception.Message }
         $Receipt.ok = $false
         $Receipt.power_state = if ($Receipt.checks.Contains('no_owned_processes') -and
             $Receipt.checks['no_owned_processes'] -and $Receipt.checks['ownership_verified'] -and

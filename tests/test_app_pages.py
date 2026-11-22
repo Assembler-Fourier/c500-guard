@@ -27,7 +27,7 @@ class AppPageTests(unittest.TestCase):
         page = self.get('/?app=1')
         self.assertIn('data-page="settings"', page)
         self.assertIn('data-src="/settings?embedded=1"', page)
-        self.assertIn('data-page="cars"', page)
+        self.assertIn('data-page="vehicles"', page)
         self.assertNotIn('target="_blank"', page)
         embedded = self.get('/settings?embedded=1')
         self.assertNotIn('class="back"', embedded)                 # the app's own rail is the way back

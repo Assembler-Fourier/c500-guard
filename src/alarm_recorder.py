@@ -39,6 +39,7 @@ class AlarmRecorder:
     MAX_CLEAN_FRAME_BYTES = 256 * 1024
     MAX_CLEAN_BUFFER_BYTES = 16 * 1024 * 1024
     MAX_CLEAN_CLIP_BYTES = 32 * 1024 * 1024
+    ENCODER_TIMEOUT_S = 90.0  # covers feeding the pipe as well as encoding
 
     def __init__(self, folder: Path | str, ffmpeg: str | None, *, before_s=10., after_s=20., keep=25,
                  enabled=True, clock=time.monotonic, on_saved=None, tie_child=None):
@@ -51,6 +52,7 @@ class AlarmRecorder:
         self._jobs: queue.Queue = queue.Queue(maxsize=4)
         self._worker = None
         self._process = None
+        self._encoder_timer = None
         self._stopped = False
         self._clip = None
         self._index: dict[str, str] = {}  # alarm id -> clip name
@@ -240,11 +242,36 @@ class AlarmRecorder:
         if ps.WINDOWS:
             kwargs["creationflags"] = kwargs.get("creationflags", 0) | BELOW_NORMAL
         process = None
+        encoder_timer = None
+        timed_out = threading.Event()
         published, completed = [], False
         try:
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                        stderr=subprocess.PIPE, **kwargs)
-            self._process = process
+            deadline = time.monotonic() + self.ENCODER_TIMEOUT_S
+
+            def expire_encoder():
+                # Own this exact child handle. A stalled stdin.write cannot
+                # reach communicate's timeout; terminating its reader breaks
+                # that write too. No process-name/PID search or shared service.
+                if process.poll() is None:
+                    timed_out.set()
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass  # The child may have exited between poll and kill.
+
+            encoder_timer = threading.Timer(self.ENCODER_TIMEOUT_S, expire_encoder)
+            encoder_timer.name = 'alarm-encoder-deadline'
+            encoder_timer.daemon = True
+            with self._lock:
+                self._process = process
+                if self._stopped:
+                    raise RuntimeError('stopping')
+                # Publishing a started timer under the same lock as stop()
+                # avoids cancelling/joining it before Thread.start finishes.
+                encoder_timer.start()
+                self._encoder_timer = encoder_timer
             if self.tie_child is not None:
                 try:
                     self.tie_child(process)
@@ -256,13 +283,18 @@ class AlarmRecorder:
                         raise RuntimeError("stopping")
                     process.stdin.write(item[1])
                 process.stdin.close()
+                process.stdin = None  # communicate must not flush a closed pipe.
             except (BrokenPipeError, OSError):
                 pass
+            if self._stopped:
+                raise RuntimeError('stopping')
             try:
-                _out, error = process.communicate(timeout=90)
+                _out, error = process.communicate(timeout=max(.001, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate()
+                expire_encoder()
+                process.communicate(timeout=5)
+                raise RuntimeError("the video encoder took too long")
+            if timed_out.is_set():
                 raise RuntimeError("the video encoder took too long")
             if process.returncode or not temporary.is_file():
                 raise RuntimeError((error or b"").decode("utf-8", "replace").strip()[-200:]
@@ -317,10 +349,23 @@ class AlarmRecorder:
             published.append(metadata)
             completed = True
         finally:
+            if encoder_timer is not None:
+                encoder_timer.cancel()
+                if encoder_timer.ident is not None:
+                    encoder_timer.join()
             if process is not None and process.poll() is None:
                 process.kill()
                 process.wait(5)
-            self._process = None
+            if process is not None:
+                for pipe in (process.stdin, process.stderr):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except OSError:
+                            pass
+            with self._lock:
+                self._process = None
+                self._encoder_timer = None
             for path in (temporary, archive_temp, metadata_temp):
                 try:
                     path.unlink(missing_ok=True)
@@ -346,10 +391,27 @@ class AlarmRecorder:
             except Exception:                                     # noqa: BLE001
                 pass
 
+    # Clips holding only alignment diagnostics (21 Nov 2026: 176 of 200 kept clips) may use at most this share of the
+    # store and go first, so they never push real alarm evidence out. Barrier-motion diagnostics count as evidence.
+    DIAGNOSTIC_SHARE = .2
+    DIAGNOSTIC_PREFIX = 'diag-alignment-'
+
     def _prune(self) -> None:
         clips = sorted((path for path in self.folder.glob("*.mp4") if CLIP_NAME.match(path.name)),
                        key=lambda path: path.stat().st_mtime)
-        for old in clips[:-self.keep]:
+        with self._lock:
+            known = dict(self._index)
+        evidence = {name for ident, name in known.items() if not ident.startswith(self.DIAGNOSTIC_PREFIX)}
+        diagnostic = {name for name in known.values() if name not in evidence}
+        cap = max(1, int(self.keep * self.DIAGNOSTIC_SHARE))
+        diagnostic_clips = [path for path in clips if path.name in diagnostic]
+        doomed = diagnostic_clips[:-cap] if len(diagnostic_clips) > cap else []
+        remaining = [path for path in clips if path not in doomed]
+        if len(remaining) > self.keep:
+            first = ([path for path in remaining if path.name in diagnostic]
+                     + [path for path in remaining if path.name not in diagnostic])
+            doomed += first[:len(remaining) - self.keep]
+        for old in doomed:
             for path in (old, old.with_suffix(".json"), old.with_suffix('.clean.zip')):
                 try:
                     path.unlink(missing_ok=True)
@@ -388,8 +450,8 @@ class AlarmRecorder:
 
     def stop(self) -> None:
         """Shutdown: drop an unfinished clip and end the encoder, so nothing is left running."""
-        self._stopped = True
         with self._lock:
+            self._stopped = True
             self._clip = None
             self._buffer.clear()
             self._buffer_clean_bytes = 0
@@ -399,7 +461,11 @@ class AlarmRecorder:
                     self._jobs.task_done()
                 except queue.Empty:
                     break
-        process = self._process
+            process = self._process
+            encoder_timer = self._encoder_timer
+        if encoder_timer is not None:
+            encoder_timer.cancel()
+            encoder_timer.join()
         if process is not None and process.poll() is None:
             try:
                 process.kill()

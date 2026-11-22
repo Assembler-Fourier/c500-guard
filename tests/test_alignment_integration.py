@@ -103,16 +103,25 @@ class AlignmentIntegrationTests(unittest.TestCase):
             for shift, expected in ((0.3, False), (1.5, False), (3.0, True)):
                 self.obj._alignment_used = ([[1., 0., 0.], [0., 1., 0.]], 0.)
                 self.obj._pending_rearm = False
+                self.obj._pending_background_reset = False
                 aligner.update.return_value = (self.frame, {
                     'reference_ready': True, 'translation_px': [shift, 0.],
                     'current_to_reference': [[1., 0., shift], [0., 1., 0.]]})
                 self.obj.align_frame(self.frame)
-                self.assertEqual(self.obj._pending_rearm, expected, shift)
+                self.assertEqual(self.obj._pending_background_reset, expected, shift)
+                self.assertFalse(self.obj._pending_rearm, 'canonical corrections must preserve AI tracks')
 
     def test_verified_pose_survives_restart_and_bad_files_are_ignored(self):
         with tempfile.TemporaryDirectory() as folder, \
                 mock.patch.object(self.obj, '_pose_path', return_value=Path(folder) / 'pose.json'):
-            self.obj._maybe_save_pose([[1., 0., 2.], [0., 1., -1.]], self.frame.shape)
+            self.obj._pose_writer.start()
+            try:
+                self.obj._maybe_save_pose([[1., 0., 2.], [0., 1., -1.]], self.frame.shape)
+                until = time.monotonic()+2.
+                while self.obj._pose_writer.saved() is None and time.monotonic() < until:
+                    time.sleep(.01)
+            finally:
+                self.assertTrue(self.obj._pose_writer.stop())
             self.assertEqual(self.obj._read_pose().tolist(), [[1., 0., 2.], [0., 1., -1.]])
             self.obj._alignment_good = None
             self.obj._alignment_pose = self.obj._read_pose()

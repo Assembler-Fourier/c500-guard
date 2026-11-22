@@ -58,12 +58,14 @@ STATIC = [
          "kind": "bool", "default": True,
          "help": "Both lanes: e.g. raising the entrance arm for a lorry whose lights set off an exit alarm. "
                  "Uses the raising/lowering switches above."},
-        {"key": "barriers.reminder", "label": "Knock when an arm raised for a car is left up", "kind": "bool",
-         "default": True},
-        {"key": "barriers.reminder_after_s", "label": "Knock after the arm has been up for", "kind": "seconds",
-         "min": 15, "max": 600, "step": 5, "default": 15.},
-        {"key": "barriers.reminder_every_s", "label": "Then knock every", "kind": "seconds",
-         "min": 15, "max": 600, "step": 5, "default": 15.},
+        {"key": "barriers.reminder", "label": "Remind me when a barrier is left up", "kind": "bool",
+         "default": True, "help": "A short beep once an arm has been up this long, then again at the interval below, "
+                                  "until it goes down. Any key silences it until that arm closes. The Live page has "
+                                  "the same switch (bell) on each lane."},
+        {"key": "barriers.reminder_after_s", "label": "Beep after the arm has been up for", "kind": "seconds",
+         "min": 15, "max": 600, "step": 5, "default": 60.},
+        {"key": "barriers.reminder_every_s", "label": "Then beep every", "kind": "seconds",
+         "min": 10, "max": 600, "step": 5, "default": 10.},
     ]},
     {"id": "recordings", "title": "Alarm videos", "items": [
         {"key": "recordings.enabled", "label": "Record a video of every alarm", "kind": "bool", "default": True,

@@ -239,7 +239,7 @@ class EntranceVerifierTests(unittest.TestCase):
         self.assertEqual(1, self.instances[1].calls)
         self.assertEqual(0, monitor.status()['recovery_attempts'])
 
-    def test_over_budget_secondary_keeps_fresh_primary_and_disables_extra(self):
+    def test_over_budget_secondary_keeps_fresh_primary_during_cooldown(self):
         def slow(_detector, _frame):
             self.offset += .501  # Controlled clock; no sleep/model workload.
         monitor = self.start(callback=slow)
@@ -249,6 +249,116 @@ class EntranceVerifierTests(unittest.TestCase):
             self.assertIn('500 ms', report['entrance_verifier']['error'])
         self.assertEqual(1, self.instances[1].calls)
         self.assertEqual(2, monitor._pipeline['results_published'])
+
+    def test_slow_healthy_secondary_recovers_without_reload_or_old_confirmation(self):
+        def slow_once(detector, _frame):
+            if detector.calls == 1:
+                self.offset += .501
+        monitor = self.start(callback=slow_once, tiny_output=[])
+        first, report, _ = self.deliver(monitor)
+        self.assertEqual([], first)
+        self.assertEqual([], report['detections'], 'late S result must be discarded')
+        self.offset += 4.
+        self.deliver(monitor)
+        self.assertEqual(1, self.instances[1].calls, 'cooldown must preserve primary cadence')
+        self.offset += 1.1
+        recovered, report, _ = self.deliver(monitor)
+        self.assertEqual('ready', report['entrance_verifier']['state'])
+        self.assertEqual([], recovered, 'recovery still needs two distinct fresh sources')
+        self.assertEqual(2, self.instances[1].calls)
+        confirmed, _, _ = self.deliver(monitor)
+        self.assertEqual(1, len(confirmed))
+        self.assertEqual(2, len(self.requests), 'never recompile an already healthy GPU model')
+        self.assertEqual(0, monitor.status()['recovery_attempts'])
+
+    def test_repeated_slow_secondary_probes_back_off_and_keep_primary(self):
+        def slow(_detector, _frame):
+            self.offset += .501
+        monitor = self.start(callback=slow)
+        self.deliver(monitor)
+        for expected_calls, delay in enumerate((5., 10., 20., 40., 60., 60.), 2):
+            self.offset += delay - 1.
+            _, report, _ = self.deliver(monitor)
+            self.assertEqual(expected_calls - 1, self.instances[1].calls)
+            self.assertEqual(.55, report['detections'][0]['confidence'])
+            self.offset += 1.1
+            _, report, _ = self.deliver(monitor)
+            self.assertEqual(expected_calls, self.instances[1].calls)
+            self.assertEqual('ready', report['state'])
+            self.assertEqual(.55, report['detections'][0]['confidence'])
+        self.assertEqual(2, len(self.requests))
+        self.assertEqual(0, monitor.status()['recovery_attempts'])
+
+    def test_successful_probe_restores_initial_cooldown_for_later_slow_check(self):
+        def intermittent(detector, _frame):
+            if detector.calls in (1, 3):
+                self.offset += .501
+        monitor = self.start(callback=intermittent)
+        self.deliver(monitor)
+        self.offset += 5.1
+        _, report, _ = self.deliver(monitor)
+        self.assertEqual('ready', report['entrance_verifier']['state'])
+        _, report, _ = self.deliver(monitor)
+        self.assertEqual('cooldown', report['entrance_verifier']['state'])
+        self.assertGreater(report['entrance_verifier']['retry_in_s'], 4.5)
+        self.assertLessEqual(report['entrance_verifier']['retry_in_s'], 5.)
+        self.offset += 5.1
+        _, report, _ = self.deliver(monitor)
+        self.assertEqual(4, self.instances[1].calls)
+        self.assertEqual('ready', report['entrance_verifier']['state'])
+
+    def test_cooldown_countdown_is_detached_from_worker_state(self):
+        def slow(_detector, _frame):
+            self.offset += .501
+        monitor = self.start(callback=slow)
+        _, report, _ = self.deliver(monitor)
+        self.assertEqual('cooldown', report['entrance_verifier']['state'])
+        self.assertIn('retrying', report['entrance_verifier']['error'])
+        self.assertNotIn('_retry_at', report['entrance_verifier'])
+        self.assertGreater(report['entrance_verifier']['retry_in_s'], 4.5)
+        report['entrance_verifier']['state'] = 'ready'
+        self.offset += 1.
+        current = monitor.status()['entrance_verifier']
+        self.assertEqual('cooldown', current['state'])
+        self.assertLessEqual(current['retry_in_s'], 4.)
+        self.assertGreater(current['retry_in_s'], 3.5)
+
+    def test_reset_and_off_do_not_bypass_cooldown_or_create_another_worker(self):
+        def slow_once(detector, _frame):
+            if detector.calls == 1:
+                self.offset += .501
+        monitor = self.start(callback=slow_once, tiny_output=[])
+        self.deliver(monitor)
+        original_worker = monitor._thread
+        monitor.reset()
+        monitor._last_submit = sm.time.monotonic()
+        monitor.update(self.frame(), False, stamp=sm.time.monotonic())
+        self.deliver(monitor)
+        self.assertEqual(1, self.instances[1].calls)
+        self.offset += 5.1
+        events, report, _ = self.deliver(monitor)
+        self.assertEqual([], events)
+        self.assertEqual('ready', report['entrance_verifier']['state'])
+        self.assertEqual(2, self.instances[1].calls)
+        self.assertIs(original_worker, monitor._thread)
+        self.assertEqual(2, len(self.requests))
+
+    def test_optional_check_cannot_spend_primary_results_remaining_freshness(self):
+        def primary_delay(detector, _frame):
+            if detector.calls == 3:
+                self.offset += 2.6
+        def otherwise_fast_check(_detector, _frame):
+            self.offset += .45
+        monitor = self.start(tiny_callback=primary_delay, callback=otherwise_fast_check)
+        self.submit(monitor)
+        self.assertTrue(self.finished.wait(1.))
+        self.assertEqual(0, self.instances[1].calls,
+                         'reserve the entire optional budget before starting its native call')
+        self.assertEqual(1, monitor._pipeline['results_published'])
+        self.assertEqual(.55, monitor.status()['detections'][0]['confidence'])
+        _, report, _ = self.deliver(monitor)
+        self.assertEqual('ready', report['entrance_verifier']['state'])
+        self.assertEqual(1, self.instances[1].calls)
 
     def test_stale_reset_off_and_stop_during_s_cannot_publish_old_source(self):
         for transition in ('stale', 'reset', 'off', 'stop'):

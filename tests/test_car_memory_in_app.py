@@ -38,7 +38,7 @@ class CarMemoryPageTests(unittest.TestCase):
 
     def test_cars_page_is_inside_the_app(self):
         page = dashboard_ui.dashboard_page('BarrierWatcher')
-        self.assertIn('data-page="cars"', page)
+        self.assertIn('data-page="vehicles"', page)
         self.assertIn('data-src="/car-memory"', page)
 
 

@@ -166,27 +166,28 @@ class UiControlReceiptContractTests(unittest.TestCase):
         self.js(r'''
 let production=true,commandBusy=false,renderedRoutes='',mounts=0,connected=true;
 const roleMeta={entrance:{name:'Entrance'},exit:{name:'Exit'},pedestrian:{name:'Footpath'}};
-const nodes=new Map(),routes=[],sounds=[],heard=[],selected=[];
-const document={activeElement:null,querySelectorAll:q=>q==='.route-card'?routes:q==='[data-lane-sound]'?sounds:[]};
-function node(id,dataset={}){const n={id,dataset,isConnected:true,textContent:'',listeners:{},
+const nodes=new Map(),routes=[],selected=[];
+const document={activeElement:null,querySelectorAll:q=>q==='.lane-top'?routes:[]};
+function node(id,dataset={}){const n={id,dataset,isConnected:true,textContent:'',disabled:false,listeners:{},
  addEventListener(k,fn){(this.listeners[k]??=[]).push(fn)},focus(){document.activeElement=this}};nodes.set(id,n);return n;}
+node('hear-entrance');node('hear-exit');     // static Health page controls, never remounted by the lanes
 const cards=node('route-cards');Object.defineProperty(cards,'innerHTML',{set(html){
- mounts++;for(const [id,n] of nodes){if(id==='route-cards')continue;n.isConnected=false;nodes.delete(id);if(document.activeElement===n)document.activeElement=null;}
- routes.length=sounds.length=0;for(const match of html.matchAll(/id="([^"]+)"/g))node(match[1]);
- for(const role of Object.keys(roleMeta)){routes.push(node('route-'+role,{route:role}));if(role!=='pedestrian'){const sound=nodes.get('hear-'+role);sound.dataset={laneSound:role};sounds.push(sound);}}
+ mounts++;for(const [id,n] of nodes){if(['route-cards','hear-entrance','hear-exit'].includes(id))continue;n.isConnected=false;nodes.delete(id);if(document.activeElement===n)document.activeElement=null;}
+ routes.length=0;for(const match of html.matchAll(/id="([^"]+)"/g))node(match[1]);
+ for(const role of Object.keys(roleMeta))routes.push(node('route-'+role,{route:role}));
 }});
 const $=id=>{assert.ok(nodes.has(id),'Mounted node '+id);return nodes.get(id)};
-const icon=()=>'',routeRole=z=>z.route_role,highlightRoute=()=>{},navigate=p=>selected.push(p),editor={selectRoute:r=>selected.push(r)},hearLane=r=>heard.push(r);
-const barrierContext=()=>({live:true,connected}),barrierSnapshot=(barriers,context)=>barriers.barriers.map(row=>({...row,state:context.connected?row.state:'unknown'}));
+const icon=()=>'',routeRole=z=>z.route_role,highlightRoute=()=>{},navigate=(p,t)=>selected.push(t),editor={selectRoute:r=>selected.push(r)};
+const barrierContext=()=>({live:true,connected}),barrierSnapshot=(barriers,context)=>barriers.barriers.map(row=>({...row,state:context.connected?row.state:'unknown',calibrated:true}));
 const status={cameraFresh:true,aligned:true,aiFresh:true};
 const state={armed:true,zones:[{route_role:'entrance',ai_objects:0}],barriers:{barriers:['entrance','exit'].map(id=>({id,state:'down',fresh:true,calibrated:true}))}};
 ''' + renderer + r'''
 renderRoutes(state,status);const focused=$('hear-entrance'),route=routes[0];focused.focus();
 for(let i=1;i<=25;i++){state.zones[0].ai_objects=i;state.barriers.barriers[0].confirmation_s=i/5;renderRoutes(state,status);
  assert.equal($('hear-entrance'),focused);assert.equal(document.activeElement,focused);assert.equal(routes[0],route);}
-assert.equal(mounts,1);assert.equal(focused.listeners.click.length,1);focused.listeners.click[0]();assert.deepEqual(heard,['entrance']);
-assert.equal(route.listeners.click.length,1);route.listeners.click[0]();assert.deepEqual(selected,['zones','entrance']);
-connected=false;renderRoutes(state,status);assert.equal(focused.disabled,true);assert.equal($('lane-entrance-arm').textContent,'Unknown');
+assert.equal(mounts,1);assert.equal(route.listeners.click.length,1);route.listeners.click[0]();assert.deepEqual(selected,['zones','entrance']);
+assert.equal($('lane-entrance-count').textContent,'25 in view');
+connected=false;renderRoutes(state,status);assert.equal(focused.disabled,true);assert.equal($('lane-entrance-arm').textContent,'UNKNOWN');
 assert.equal($('lane-entrance-status').textContent,'Unavailable');assert.equal(mounts,1);
 ''')
 

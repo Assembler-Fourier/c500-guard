@@ -13,7 +13,9 @@ need operator calibration. Masks must exclude moving scenes and time overlays.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
+import threading
 import time
 
 import numpy as np
@@ -24,6 +26,25 @@ try:
 except (ImportError, OSError) as exc:
     cv2 = None
     _CV_ERROR = f"OpenCV unavailable: {exc}"
+
+
+# The same frame is matched against several references (lighting variants, probes, learning candidates). They share
+# one search mask and ORB setting, so the frame's ORB features are computed once and reused (21 Nov 2026).
+_FEATURE_LOCK = threading.Lock()
+_FEATURE_CACHE = [None]          # (key, keypoints, descriptors) of the last frame
+
+
+def _shared_frame_features(orb, orb_key, gray, mask, mask_key):
+    """ORB keypoints/descriptors of ``gray`` under ``mask``; identical inputs reuse the last result."""
+    key = (hashlib.blake2b(np.ascontiguousarray(gray).data, digest_size=16).digest(), gray.shape, mask_key, orb_key)
+    with _FEATURE_LOCK:
+        cached = _FEATURE_CACHE[0]
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+    keypoints, descriptors = orb.detectAndCompute(gray, mask)
+    with _FEATURE_LOCK:
+        _FEATURE_CACHE[0] = (key, keypoints, descriptors)
+    return keypoints, descriptors
 
 
 @dataclass(frozen=True)
@@ -69,6 +90,11 @@ class AlignmentConfig:
     weak_min_correlation: float = .5
     weak_min_good_tiles: int = 3
     pose_tolerance_px: float = 5.0
+    # A fixed source still produces small, varying ORB/RANSAC fits. Retain a
+    # verified pose only while CURRENT distributed landmarks, static tiles and
+    # full alarm-region visibility independently validate it. This is a bound
+    # against the applied pose, not the preceding estimate, so drift accumulates.
+    stable_pose_gap_px: float = 3.0
 
 
 def build_feature_mask(shape, include_rects=None, exclude_rects=(), border_px=10,
@@ -196,6 +222,8 @@ class SceneAligner:
         self.required_mask = None
         self.valid_mask = None
         self._gray = self._keypoints = self._descriptors = self._orb = None
+        self._reference_blur = self._search_mask = self._search_radius = None
+        self._search_mask_key = None
         self._bounds = None
         self._last = self._state("uncalibrated", "Explicit reference calibration required")
 
@@ -259,6 +287,7 @@ class SceneAligner:
             self.reference, self.feature_mask = reference, mask.copy()
             self.required_mask, self._safe_mask = required_mask, safe_mask
             self._gray, self._keypoints, self._descriptors, self._orb = gray, keypoints, descriptors, orb
+            self._reference_blur = cv2.GaussianBlur(gray, (5, 5), 0).astype(np.float32)
             self._last = self._state("ready", "Reference calibrated; awaiting current-frame validation",
                                      reference_features=len(keypoints), distribution=distribution)
         except Exception as exc:
@@ -309,7 +338,7 @@ class SceneAligner:
     def _static_agreement(self, aligned_gray, valid):
         """Compare separate textured static tiles; affine brightness tolerated."""
         x1, y1, x2, y2 = self._bounds
-        reference = cv2.GaussianBlur(self._gray, (5, 5), 0).astype(np.float32)
+        reference = self._reference_blur
         current = cv2.GaussianBlur(aligned_gray, (5, 5), 0).astype(np.float32)
         # Keep the comparison filter away from moving regions and warp borders.
         mask = (self._safe_mask != 0) & (valid != 0)
@@ -366,6 +395,75 @@ class SceneAligner:
         self.valid_mask = valid
         return aligned
 
+    @staticmethod
+    def _pose_values(matrix, shape):
+        """Public geometry always describes the applied matrix, including holds."""
+        height, width = shape[:2]
+        center = np.float64([width / 2., height / 2.])
+        corners = np.float64([[0, 0], [width-1, 0], [width-1, height-1], [0, height-1]])
+        displacement = center @ matrix[:, :2].T + matrix[:, 2] - center
+        return dict(current_to_reference=matrix.round(6).tolist(),
+            reference_to_current=cv2.invertAffineTransform(matrix).round(6).tolist(),
+            translation_px=displacement.round(3).tolist(),
+            rotation_deg=round(math.degrees(math.atan2(matrix[1, 0], matrix[0, 0])), 4),
+            scale=round(math.hypot(matrix[0, 0], matrix[1, 0]), 6),
+            max_corner_displacement_px=round(float(np.linalg.norm(
+                corners @ matrix[:, :2].T + matrix[:, 2] - corners, axis=1).max()), 3))
+
+    def _validated_stable_prior(self, frame, prior, candidate, current_points, reference_points):
+        """Return a held image only if the current strong evidence validates it.
+
+        Nothing is smoothed or extrapolated. A real displacement beyond this
+        bounded deadband, or a prior that no longer fits, uses the independently
+        validated new estimate immediately. A rejected estimate never enters here.
+        """
+        cfg = self.config
+        gap = pose_gap_px(candidate, prior, frame.shape)
+        note = {'action': 'accepted', 'candidate_delta_px': round(gap, 3),
+                'supported_motion': bool(gap > 1e-6), 'reason': 'validated correction'}
+        if (not isinstance(cfg.stable_pose_gap_px, (int, float))
+                or isinstance(cfg.stable_pose_gap_px, bool)
+                or not math.isfinite(cfg.stable_pose_gap_px)
+                or not 0 <= cfg.stable_pose_gap_px <= 3.0
+                or gap > cfg.stable_pose_gap_px):
+            note['reason'] = 'outside bounded stable-pose tolerance'
+            return None, None, note
+        a, b = prior[0, 0], prior[1, 0]
+        expected = np.float64([[a, -b], [b, a]])
+        if not np.allclose(prior[:, :2], expected, rtol=0., atol=1e-6):
+            note['reason'] = 'prior is not a similarity transform'
+            return None, None, note
+        center = np.float64([frame.shape[1] / 2., frame.shape[0] / 2.])
+        displacement = center @ prior[:, :2].T + prior[:, 2] - center
+        if (np.linalg.norm(displacement) > cfg.max_translation_px
+                or abs(math.degrees(math.atan2(b, a))) > cfg.max_rotation_deg
+                or abs(math.hypot(a, b) - 1) > cfg.max_scale_change
+                or pose_gap_px(prior, np.float64([[1, 0, 0], [0, 1, 0]]), frame.shape)
+                   > cfg.max_corner_displacement_px):
+            note['reason'] = 'prior exceeds correction limits'
+            return None, None, note
+        errors = np.linalg.norm(current_points @ prior[:, :2].T + prior[:, 2] - reference_points, axis=1)
+        median, p90 = float(np.median(errors)), float(np.percentile(errors, 90))
+        note.update(prior_median_error_px=round(median, 3), prior_p90_error_px=round(p90, 3))
+        if median > cfg.max_median_error_px or p90 > cfg.max_p90_error_px:
+            note['reason'] = 'prior no longer fits current landmarks'
+            return None, None, note
+        held, valid = self._warp(frame, prior)
+        fraction = float(np.count_nonzero(valid)) / valid.size
+        if (fraction < cfg.min_valid_fraction
+                or self.required_mask is not None and np.any(self.required_mask & (valid == 0))):
+            note['reason'] = 'prior no longer preserves required visibility'
+            return None, None, note
+        agreement = self._static_agreement(cv2.cvtColor(held, cv2.COLOR_RGB2GRAY), valid)
+        note['prior_static_agreement'] = agreement
+        if (agreement['good_tiles'] < cfg.min_good_tiles
+                or agreement['good_fraction'] < cfg.min_good_tile_fraction):
+            note['reason'] = 'prior no longer matches static scene'
+            return None, None, note
+        note.update(action='held', supported_motion=False,
+                    reason='current static evidence validates the bounded prior pose')
+        return held, valid, note
+
     def update(self, frame, prior=None):
         """Estimate this frame's transform to the reference.
 
@@ -403,8 +501,16 @@ class SceneAligner:
             # Search only near the known landmark mask; its shifted locations
             # may lie outside the exact reference mask before alignment.
             radius = int(math.ceil(cfg.max_corner_displacement_px))
-            search = cv2.dilate(self._safe_mask, np.ones((radius * 2 + 1, radius * 2 + 1), np.uint8))
-            keypoints, descriptors = self._orb.detectAndCompute(gray, search)
+            # Reference pixels and its search footprint do not change per
+            # frame. Recompute only after calibration or a changed search limit.
+            if self._search_mask is None or self._search_radius != radius:
+                self._search_mask = cv2.dilate(
+                    self._safe_mask, np.ones((radius * 2 + 1, radius * 2 + 1), np.uint8))
+                self._search_radius = radius
+                self._search_mask_key = hashlib.blake2b(
+                    np.ascontiguousarray(self._search_mask).data, digest_size=16).digest()
+            keypoints, descriptors = _shared_frame_features(
+                self._orb, (self.config.max_features, 16, 31, 10, 8), gray, self._search_mask, self._search_mask_key)
             if descriptors is None or len(keypoints) < cfg.min_matches:
                 if prior is None or descriptors is None or len(keypoints) < cfg.weak_min_matches:
                     return reject("Insufficient current-frame landmarks")
@@ -487,8 +593,27 @@ class SceneAligner:
                     return reject("Static scene appearance changed or alignment is ambiguous")
                 weak.append("scene lit differently from the reference")
             if not weak:
+                stabilization = {'action': 'accepted', 'candidate_delta_px': None,
+                                 'supported_motion': False, 'reason': 'initial validated pose'}
+                if prior is not None:
+                    held, held_valid, stabilization = self._validated_stable_prior(
+                        frame, prior, matrix, current_points[inliers], reference_points[inliers])
+                    if held is not None:
+                        values['estimate_to_reference'] = values['current_to_reference']
+                        values['estimate_static_agreement'] = values['static_agreement']
+                        values['estimate_median_error_px'] = values['median_error_px']
+                        values['estimate_p90_error_px'] = values['p90_error_px']
+                        values['median_error_px'] = stabilization['prior_median_error_px']
+                        values['p90_error_px'] = stabilization['prior_p90_error_px']
+                        values.update(self._pose_values(prior, frame.shape))
+                        values['static_agreement'] = stabilization['prior_static_agreement']
+                        values['valid_fraction'] = round(float(np.count_nonzero(held_valid)) / held_valid.size, 4)
+                        aligned, valid = held, held_valid
+                values['stabilization'] = stabilization
                 self.valid_mask = valid
-                self._last = self._state("aligned", "Supported small framing correction", accepted=True,
+                reason = ("Current static landmarks validate the stable camera position"
+                          if stabilization['action'] == 'held' else "Supported small framing correction")
+                self._last = self._state("aligned", reason, accepted=True,
                                          processing_ms=round((time.perf_counter() - started) * 1000, 2), **values)
                 return aligned, self.status()
             gap = pose_gap_px(matrix, prior, frame.shape)
@@ -499,8 +624,9 @@ class SceneAligner:
             held = self.warp(frame, prior)
             if held is None:
                 return reject("A required alarm region is no longer fully visible")
-            values.update(current_to_reference=prior.round(6).tolist(),
-                          reference_to_current=cv2.invertAffineTransform(prior).round(6).tolist())
+            values.update(self._pose_values(prior, frame.shape))
+            values['stabilization'] = {'action': 'held', 'candidate_delta_px': round(gap, 3),
+                'supported_motion': False, 'reason': 'weak evidence confirms verified pose'}
             self._last = self._state("confirmed", "Weak landmarks confirm the last verified camera position",
                                      accepted=True, weak=True,
                                      processing_ms=round((time.perf_counter() - started) * 1000, 2), **values)

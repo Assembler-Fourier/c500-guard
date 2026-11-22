@@ -112,6 +112,13 @@ def _track_score(track, bbox, now):
     forecast = _association_score(predicted, bbox)
     if forecast is None:
         return raw
+    if (elapsed <= .75 and track.label in VEHICLE_LABELS
+            and len(track.trail) >= 3 and track.confidence >= .5):
+        # With recent established motion, old-position glare must not win just
+        # because it overlaps the previous box. Keep this independent of zones;
+        # a car retains its identity as it crosses approach/barrier boundaries.
+        # Uncertain, short or stale trajectories retain the legacy fallback.
+        return forecast + .05
     return max(raw or 0., forecast + .05)
 
 
@@ -132,6 +139,19 @@ def zone_accepts(zone, label, point):
 EDGE_Y = .985     # a box reaching this far down is cut off by the bottom of the picture
 
 
+def _bottom_edge_y(zone):
+    """A calibrated detector-box edge, bounded to the last five percent of the image.
+
+    Some clipped boxes stop a few pixels short of the picture boundary. Keep
+    the legacy threshold unless this lane explicitly opts into a measured one.
+    """
+    value = getattr(zone, 'bottom_edge_y', EDGE_Y)
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not .95 <= value <= 1.):
+        return EDGE_Y
+    return float(value)
+
+
 def zone_accepts_box(zone, label, ground, bbox):
     """zone_accepts, plus (opt-in bottom_edge_entry) vehicles cut off by the bottom edge of the picture.
 
@@ -139,9 +159,62 @@ def zone_accepts_box(zone, label, ground, bbox):
     """
     if zone_accepts(zone, label, ground):
         return True
-    if not getattr(zone, 'bottom_edge_entry', False) or bbox[3] < EDGE_Y:
+    if not getattr(zone, 'bottom_edge_entry', False) or bbox[3] < _bottom_edge_y(zone):
         return False
     return any(zone_accepts(zone, label, (ground[0], y)) for y in (.97, .95, .93, .91, .89))
+
+
+DEPARTING_TOWARD_SPEED = .02   # normalised picture widths/s along the arrival way that still count as arriving
+
+
+def _directed_motion_start(samples, dx, dy, minimum):
+    """Latest start of two separately observed advances, including slow returns."""
+    if len(samples) < 3:
+        return None
+    end_at, end = samples[-1]
+    for index in range(len(samples)-3, -1, -1):
+        start_at, start = samples[index]
+        elapsed = end_at - start_at
+        total = (end[0]-start[0])*dx + (end[1]-start[1])*dy
+        if not 0 < elapsed <= 1.5 or total < minimum or total/elapsed <= DEPARTING_TOWARD_SPEED:
+            continue
+        for middle_at, middle in samples[index+1:-1]:
+            first = (middle[0]-start[0])*dx + (middle[1]-start[1])*dy
+            second = (end[0]-middle[0])*dx + (end[1]-middle[1])*dy
+            if start_at < middle_at < end_at and min(first, second) >= minimum/4:
+                return start_at
+    return None
+
+
+def _departing_from(zone, track, visit):
+    """A confirmed exit visit is leaving unless two fresh advances show a return.
+
+    An isolated box-size/position correction is not a turn. New identities have
+    no confirmed departure history, so their first-sighting policy is unchanged.
+    """
+    groups = getattr(zone, 'ignore_from_routes', None)
+    if not groups or not track.groups_seen.intersection(groups):
+        return False
+    toward = getattr(zone, 'toward_direction', None) or getattr(zone, 'arrival_direction', None)
+    samples = track.ground_samples
+    if toward is not None and len(samples) >= 3:
+        try:
+            dx, dy = (float(v) for v in toward)
+        except (TypeError, ValueError):
+            return True
+        length = math.hypot(dx, dy)
+        if length > 1e-9:
+            dx, dy = dx / length, dy / length
+            minimum = max(.012, float(getattr(zone, 'arrival_min_progress', .012)))
+            toward_at = _directed_motion_start(samples, dx, dy, minimum)
+            away_at = _directed_motion_start(samples, -dx, -dy, minimum)
+            if away_at is not None and (toward_at is None or away_at > toward_at):
+                visit.departure_released = False
+            elif toward_at is not None:
+                visit.departure_released = True
+    # A proven return stays eligible when it stops waiting. A new departure
+    # or expiry of this zone visit resets that release; stationary readings do not.
+    return not visit.departure_released
 
 
 def _weak_floor(zone):
@@ -176,6 +249,7 @@ class _Visit:
     strong_confirmation_samples: list = field(default_factory=list)
     strong_confirmation_used: bool = False
     weak_hits: int = 0              # observations below the zone floor (moving-only evidence)
+    departure_released: bool = False
 
 
 @dataclass
@@ -198,6 +272,8 @@ class _Track:
     trail: list = field(default_factory=list)    # recent ground points, for display
     first_seen: float | None = None               # where and when this object was first followed
     first_ground: tuple | None = None
+    groups_seen: set = field(default_factory=set)  # route groups with confirmed, eligible visits
+    ground_samples: list = field(default_factory=list)  # bounded source-timed motion proof
 
 
 class ObjectVisitTracker:
@@ -304,8 +380,9 @@ class ObjectVisitTracker:
         if direction is None:
             return True
         ground = _ground(bbox)
-        if (getattr(zone, 'bottom_edge_entry', False) and bbox[3] >= EDGE_Y and visit.origin_bbox
-                and visit.origin_bbox[3] >= EDGE_Y):
+        edge_y = _bottom_edge_y(zone)
+        if (getattr(zone, 'bottom_edge_entry', False) and bbox[3] >= edge_y and visit.origin_bbox
+                and visit.origin_bbox[3] >= edge_y):
             # Pinned to the bottom edge: follow the top of the box (it rises as the vehicle drives on).
             ground = (ground[0], visit.origin[1] + (bbox[1] - visit.origin_bbox[1]))
         progress = ((ground[0] - visit.origin[0]) * direction[0]
@@ -463,6 +540,10 @@ class ObjectVisitTracker:
             ground = _ground(bbox)
             track.trail.append((round(ground[0], 4), round(ground[1], 4)))
             del track.trail[:-10]
+            if not track.ground_samples or now > track.ground_samples[-1][0]:
+                track.ground_samples.append((now, ground))
+                track.ground_samples = [sample for sample in track.ground_samples[-16:]
+                                        if 0 <= now - sample[0] <= 1.5]
             current_zones, region_status = [], {}
             inside_zones = [zone_accepts_box(zone, label, ground, bbox) for zone in zones]
             inside_groups = {getattr(zone, 'route_group', '') for index, zone in enumerate(zones)
@@ -484,6 +565,17 @@ class ObjectVisitTracker:
                     floor = _weak_floor(zone)
                     weak = (confidence < threshold and floor is not None and confidence >= floor
                             and _direction(zone) is not None)
+                    entry = getattr(zone, 'ai_moving_entry_polygon', None)
+                    entry_missing = bool(weak and entry and (visit is None or not visit.active)
+                                         and (track.first_ground is None
+                                              or not point_in_polygon(*track.first_ground, entry)))
+                    if entry_missing:
+                        # A reflection can move up the road beneath a real car.
+                        # Weak NEW visits require an observed lane-entry origin;
+                        # a single stronger flash must not legitimise that ghost.
+                        # Normal observations can still confirm a vehicle first
+                        # visible mid-lane; confirmed identities remain intact.
+                        weak = False
                     if confidence < threshold and not weak:
                         if visit is not None:
                             visit.hits = 0
@@ -497,7 +589,8 @@ class ObjectVisitTracker:
                             visit.reversal_peak, visit.reversal_hits = None, 0
                             visit.reversal_started = None
                             visit.allowed = False
-                        region_status[zone.name] = 'below confidence threshold'
+                        region_status[zone.name] = ('weak arrival has no entry evidence' if entry_missing else
+                                                    'below confidence threshold')
                         continue
                     if visit is None:
                         visit = track.visits[zone_index] = _Visit(
@@ -542,6 +635,9 @@ class ObjectVisitTracker:
                     # repeatedly in the barrier commitment area. Parking turns
                     # and cars waiting on the shared curve remain track-only.
                     allowed = visit.in_confirmation and direction_allowed
+                    departing = _departing_from(zone, track, visit)
+                    if departing:
+                        allowed = False      # came from the exit lane: leaving, not arriving
                     if window and _direction(zone) and visit.direction_state != 'stationary':
                         # Both confirmation and travel must be fresh. An old
                         # approach followed by parked-box jitter cannot qualify
@@ -557,11 +653,16 @@ class ObjectVisitTracker:
                     needed = count + (1 if visit.weak_hits and visit.hits - visit.weak_hits < count else 0)
                     visit.strong_confirmation_used = strong_confirmed and visit.confirmation_hits < needed
                     visit.allowed = allowed and (visit.confirmation_hits >= needed or strong_confirmed)
+                    if visit.group and visit.allowed:
+                        # A single weak/shifted box touching another lane must
+                        # not permanently label a real arrival as departing.
+                        track.groups_seen.add(visit.group)
                     if not visit.active and visit.allowed:
                         visit.active = True
                     if visit.group and track.routes[visit.group].emitted:
                         visit.emitted = True
                     region_status[zone.name] = ('already alerted' if visit.emitted else
+                                               'departing (came from the exit lane)' if departing else
                                                'tracking approach' if not visit.in_confirmation else
                                                'moving away' if visit.direction_state == 'away' else
                                                'confirmed' if visit.active and visit.allowed else

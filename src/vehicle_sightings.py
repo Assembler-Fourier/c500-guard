@@ -5,13 +5,16 @@ vehicle track that passes through an entrance or exit zone, up to four clean cro
 frame) and a small description are written when the track ends:
     <state>/vehicle-sightings/<YYYYmmdd-HHMMSS>-<track>/meta.json + crop_0.jpg ...
 No number plates are read. Everything older than ``keep_hours`` (12) is deleted. Display/evidence only: nothing here
-can raise, delay or silence an alarm, and any error is swallowed.
+raises or silences alarms. The live watcher's bounded asynchronous persistence keeps storage writes and retention
+off the detection thread; standalone callers can retain synchronous writes. Errors remain local to history.
 """
 from __future__ import annotations
 
 import json
+from collections import deque
 from pathlib import Path
 import shutil
+import threading
 import time
 import uuid
 
@@ -24,7 +27,7 @@ VEHICLES = frozenset({"car", "bus", "truck", "motorcycle"})
 class VehicleSightings:
     def __init__(self, folder, *, keep_hours: float = 12., max_crops: int = 4, finish_after_s: float = 4.,
                  min_width: int = 36, min_confidence: float = .45, enabled: bool = True,
-                 clock=time.monotonic, wall=time.time):
+                 clock=time.monotonic, wall=time.time, async_writes: bool = False, max_pending: int = 8):
         self.folder = Path(folder)
         self.keep_hours = float(keep_hours)
         self.max_crops = int(max_crops)
@@ -39,6 +42,67 @@ class VehicleSightings:
         self.written = 0
         self.diagnostics_written = 0
         self.last_error = ""
+        # The live watcher opts in. Finished records are detached from _tracks;
+        # no storage operation runs while the detector holds this condition.
+        self.async_writes = bool(async_writes)
+        self._pending = deque()
+        self._max_pending = max(1, min(32, int(max_pending)))
+        self._condition = threading.Condition()
+        self._writer = None
+        self._closing = False
+        self._writing = False
+        self.dropped_writes = 0
+
+    def _submit(self, job) -> bool:
+        if not self.async_writes:
+            self._perform(job)
+            return True
+        with self._condition:
+            if self._closing:
+                return False
+            if len(self._pending) >= self._max_pending:
+                self.dropped_writes += 1
+                self.last_error = "Vehicle history storage busy; optional record skipped"
+                return False
+            self._pending.append(job)
+            if self._writer is None:
+                self._writer = threading.Thread(target=self._write_loop, name='vehicle-history', daemon=True)
+                try:
+                    self._writer.start()
+                except Exception as exc:
+                    self._pending.pop()
+                    self._writer = None
+                    self.dropped_writes += 1
+                    self.last_error = f"Vehicle history worker unavailable ({type(exc).__name__})"
+                    return False
+            self._condition.notify_all()
+        return True
+
+    def _perform(self, job):
+        if job[0] == 'purge':
+            self.purge()
+        else:
+            _, track_id, record, diagnostic_only = job
+            self._write(track_id, record, diagnostic_only=diagnostic_only)
+
+    def _write_loop(self):
+        while True:
+            with self._condition:
+                while not self._pending and not self._closing:
+                    self._condition.wait()
+                if self._closing:
+                    return
+                job = self._pending.popleft()
+                self._writing = True
+            try:
+                self._perform(job)
+            except Exception as exc:  # noqa: BLE001 - history never disables alarms
+                self.last_error = f"{type(exc).__name__}: {exc}"[:200]
+            finally:
+                job = None  # release finished crop arrays even while idle
+                with self._condition:
+                    self._writing = False
+                    self._condition.notify_all()
 
     # -- feeding ---------------------------------------------------------------
     def observe(self, objects, stamp, frame, zones) -> None:
@@ -49,6 +113,8 @@ class VehicleSightings:
             self.last_error = f"{type(exc).__name__}: {exc}"[:200]
 
     def _observe(self, objects, stamp, frame, zones) -> None:
+        if self._closing:
+            return
         now = self.clock()
         if self.enabled and stamp is not None and stamp != self._last_stamp and frame is not None:
             objects = [o for o in (objects or []) if isinstance(o, dict)]
@@ -61,7 +127,7 @@ class VehicleSightings:
         self._finish(now, zones)
         if now - self._last_purge > 600:
             self._last_purge = now
-            self.purge()
+            self._submit(('purge',))
 
     def _add(self, obj, frame, roles, brightness, now) -> None:
         if obj.get("label") not in VEHICLES or float(obj.get("confidence", 0)) < self.min_confidence:
@@ -94,6 +160,7 @@ class VehicleSightings:
             record.setdefault("first_role", here)
         del record["path"][:-60]
         record["brightness"].append(brightness)
+        del record["brightness"][:-60]
         # Keep the evidence which actually reached the tracker, including why
         # it did not alert. Ground points alone cannot distinguish an incorrect
         # zone from a confidence rejection or an identity jump. This is bounded,
@@ -136,7 +203,7 @@ class VehicleSightings:
         for track_id in [t for t, r in self._tracks.items() if now - r["last"] > self.finish_after_s]:
             record = self._tracks.pop(track_id)
             if record["roles"] and record.get("observations"):
-                self._write(track_id, record, diagnostic_only=not record["crops"] or self.fragment(record))
+                self._submit(('write', track_id, record, not record["crops"] or self.fragment(record)))
 
     @staticmethod
     def fragment(record) -> bool:
@@ -211,17 +278,42 @@ class VehicleSightings:
                 continue
         return removed
 
-    def flush(self) -> None:
-        """Shutdown: write what is complete enough, so a vehicle in view at OFF is not lost."""
+    def flush(self, timeout=1.) -> None:
+        """Shutdown: save finished evidence, then stop within a bounded wait.
+
+        A stuck native write cannot be cancelled by Python. It stays owned by
+        this watcher process; the existing Full OFF process shutdown owns that
+        final boundary. No queued work begins after this method closes storage.
+        """
         try:
             for track_id in list(self._tracks):
                 record = self._tracks.pop(track_id)
                 if record["roles"] and record.get("observations"):
-                    self._write(track_id, record, diagnostic_only=not record["crops"] or self.fragment(record))
+                    self._submit(('write', track_id, record, not record["crops"] or self.fragment(record)))
         except Exception:  # noqa: BLE001
             pass
+        if not self.async_writes:
+            return
+        deadline = time.monotonic() + max(0., float(timeout))
+        with self._condition:
+            while (self._pending or self._writing) and time.monotonic() < deadline:
+                self._condition.wait(max(0., deadline - time.monotonic()))
+            self._closing = True
+            if self._pending:
+                self.dropped_writes += len(self._pending)
+                self._pending.clear()
+                self.last_error = "Vehicle history shutdown timed out; pending optional records skipped"
+            if self._writing:
+                self.last_error = "Vehicle history shutdown waiting for storage; process shutdown owns the write"
+            self._condition.notify_all()
+            writer = self._writer
+        if writer is not None and writer is not threading.current_thread():
+            writer.join(max(0., deadline-time.monotonic()))
 
     def status(self) -> dict:
         return {"enabled": self.enabled, "following": len(self._tracks), "written": self.written,
                 "diagnostics_written": self.diagnostics_written,
-                "keep_hours": self.keep_hours, "error": self.last_error}
+                "keep_hours": self.keep_hours, "error": self.last_error,
+                "async_writes": self.async_writes, "pending_writes": len(self._pending),
+                "writing": self._writing, "dropped_writes": self.dropped_writes,
+                "writer_alive": bool(self._writer and self._writer.is_alive()), "closing": self._closing}

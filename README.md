@@ -4,6 +4,8 @@ A local camera dashboard and attention alarm for a supervised entrance, exit and
 
 The application combines object observations, configured route geometry, image-change cues and separately calibrated barrier evidence. It provides lane-specific alarm tones, acknowledgement, visit grouping, stale-camera warnings, local incident recording and an optional vehicle appearance report. It does not operate a physical barrier. Detection and appearance matching can be wrong or late; they assist an operator and do not establish identity or guarantee that a vehicle was detected.
 
+**22 November audit:** this source snapshot includes earlier implemented work and documents seven open defects. No fixes were applied during the audit. In particular, a separately observed follower can inherit an acknowledged visit; see the QA report before assessing deployment readiness.
+
 ## Start here
 
 - [Windows setup and operation](docs/WINDOWS.md)
@@ -12,6 +14,8 @@ The application combines object observations, configured route geometry, image-c
 - [Running isolated regression tests](docs/TESTING.md)
 - [Private data and retention](docs/PRIVACY.md)
 - [Current release verification](docs/current-deployment.md)
+- [Independent QA: seven open findings](docs/QA-2026-11-22.md)
+- [Comparison research and proposed upgrades](docs/UPGRADE-RESEARCH-2026-11-22.md)
 
 Python 3.10 or newer and FFmpeg are required. The Windows integrations use scheduled tasks, native input hooks and optional Intel graphics acceleration. Core detector code also has CPU support. The native window source is in `app/`; a browser remains available when that optional executable is absent.
 

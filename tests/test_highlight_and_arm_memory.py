@@ -59,6 +59,31 @@ class OverlayObjectTests(unittest.TestCase):
         rows = watch.Watcher._overlay_objects([{'label': 'car', 'confidence': .9, 'box_n': [.1, .1, .2, .2]}] * 30)
         self.assertEqual(12, len(rows))
 
+    def test_unscoped_road_guess_is_not_drawn_as_lane_traffic(self):
+        guess = {'label': 'car', 'confidence': .55, 'track_id': 275,
+                 'box_n': [.67, .47, .87, .63], 'regions': [], 'confirmed_regions': []}
+        person = {**guess, 'label': 'person', 'track_id': 276}
+        lane_car = {**guess, 'regions': ['Entrance waiting'], 'track_id': 277}
+        observed = [guess] * 13 + [person, lane_car]
+        rows = watch.Watcher._overlay_objects(observed)
+        self.assertEqual([276, 277], [row['id'] for row in rows])
+        self.assertEqual([], guess['regions'], 'Display filtering must not mutate AI evidence')
+
+    def test_outside_track_keeps_direction_history_when_it_enters_lane(self):
+        tracker = ObjectVisitTracker()
+        zone = watch.Zone(name='lane', rect=(.3, .1, .5, .8), trigger='ai',
+                          arrival_direction=[1, 0], arrival_min_progress=.01)
+        _, seen = tracker.update([{'label': 'car', 'confidence': .8, 'bbox': [100, 100, 160, 180]}],
+                                 [zone], 640, 360, 100.)
+        identity = seen[0]['track_id']
+        self.assertEqual([], watch.Watcher._overlay_objects(seen))
+        _, seen = tracker.update([{'label': 'car', 'confidence': .8, 'bbox': [170, 100, 230, 180]}],
+                                 [zone], 640, 360, 100.5)
+        rows = watch.Watcher._overlay_objects(seen)
+        self.assertEqual(identity, rows[0]['id'])
+        self.assertEqual('lane', rows[0]['zone'])
+        self.assertEqual(2, len(rows[0]['trail']))
+
 
 class ChangeHighlightTests(unittest.TestCase):
     def setUp(self):
@@ -178,10 +203,10 @@ class PageOverlayTests(unittest.TestCase):
     def test_lane_cards_replace_remembered_pills_and_keep_object_overlay(self):
         page = dashboard_ui.dashboard_page('BarrierWatcher')
         self.assertNotIn('id="barrier-pills"', page)
-        self.assertIn('barrier.className=`lane-barrier ${arm.state}`', page)
+        self.assertIn('pill.className=`arm-pill ${arm.state}`', page)
         self.assertIn('id="lane-${role}-arm"', page)
-        self.assertIn("arm.state==='unknown'?'Unknown'", page)
-        self.assertIn('data-lane-sound="${role}"', page)
+        self.assertIn("arm.state==='unknown'?'UNKNOWN'", page)
+        self.assertIn('data-lane-sound="entrance"', page)
         self.assertIn('<svg id="object-overlay"', page)
 
     def test_overlay_draws_objects_and_changes_and_clears_on_alignment_loss(self):
@@ -200,7 +225,7 @@ const svg=nodes['object-overlay'].innerHTML;
 assert.match(svg,/<g class="obj alert vehicle">/);
 assert.match(svg,/<polyline points="320.0,216.0 352.0,216.0"\/>/);
 assert.match(svg,/<rect x="320.0" y="180.0" width="64.0" height="36.0"/);
-assert.match(svg,/CAR 82% #12 · Exit/);
+assert.match(svg,/CAR 82% · Exit/);
 assert.match(svg,/<g class="chg alarm">/);
 ctx.renderObjects({...s,objects:[],change_boxes:[]},{...status,aligned:false});
 assert.equal(nodes['object-overlay'].innerHTML,'');

@@ -133,13 +133,25 @@ def _position_evidence(present, absent):
     return float(np.clip((present-absent)/max(1e-6, 1.-absent), -1., 1.))
 
 
-def _photometric(reference, current, mask):
-    """Robust gain/offset fit; return unknown for adverse exposure changes."""
+def _photometric_indices(reference, mask):
+    """The reference pixels a photometric fit samples (None: too little detail). Depends only on reference + mask."""
     selected = np.asarray(mask, bool) & (reference > 12) & (reference < 238)
     indices = np.flatnonzero(selected)
     if len(indices) < 100:
+        return None
+    return indices[::max(1, len(indices)//4096)]
+
+
+def _photometric(reference, current, mask, indices=False):
+    """Robust gain/offset fit; return unknown for adverse exposure changes.
+
+    ``indices``: the result of _photometric_indices(reference, mask) when the caller already has it (None means
+    "too little detail"); omitted, it is computed here. The fit itself is unchanged.
+    """
+    if indices is False:
+        indices = _photometric_indices(reference, mask)
+    if indices is None:
         return None, "Insufficient reference detail", None
-    indices = indices[::max(1, len(indices)//4096)]
     original = reference.ravel()[indices].astype(np.float64)
     observed = current.ravel()[indices].astype(np.float64)
     keep = np.ones(len(indices), bool)
@@ -162,6 +174,31 @@ def _photometric(reference, current, mask):
 
 
 class BarrierMonitor:
+    SHARED_GRAY = True   # update()/road_clear() accept the frame's grey image computed once by the caller
+
+    @staticmethod
+    def prepare_gray(frameRGB):
+        """The grey working image update() and road_clear() use, or None when the frame is unusable."""
+        try:
+            return _gray(frameRGB)
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+    @staticmethod
+    def _usable_gray(gray):
+        return (isinstance(gray, np.ndarray) and gray.shape == (HEIGHT, WIDTH)
+                and gray.dtype == np.float32)
+
+    def _indices_for(self, key, reference, mask_source, mask):
+        cached = self._sample_cache.get(key)
+        if cached is not None and cached[0] is reference and cached[1] is mask_source:
+            return cached[2]
+        indices = _photometric_indices(reference, mask)
+        self._sample_cache[key] = (reference, mask_source, indices)
+        if len(self._sample_cache) > 32:
+            self._sample_cache.pop(next(iter(self._sample_cache)))
+        return indices
+
     def __init__(self, storage_path=None, seed_path=None, source_key="", clock=time.monotonic, lines=None):
         self.lines = validate_lines(lines)
         self.storage_path = Path(storage_path) if storage_path else None
@@ -173,6 +210,9 @@ class BarrierMonitor:
         self._reference = None
         self._road_reference = []
         self._frames = deque(maxlen=9)
+        # Work that depends only on fixed inputs, reused while those inputs are the same objects.
+        self._sample_cache = {}       # key -> (reference, mask_source, indices)
+        self._road_mask_cache = {}    # key -> (route_mask, lines, prepared_mask)
         self._last_at = None
         self._aligned = False
         self._load_reason = "Barrier references are not calibrated"
@@ -250,7 +290,7 @@ class BarrierMonitor:
     def _unknown(self, reason="Waiting for a current barrier image"):
         self._observations = {identity: self._blank(reason) for identity in IDS}
 
-    def update(self, frameRGB, stamp, aligned=True):
+    def update(self, frameRGB, stamp, aligned=True, gray=None):
         with self._lock:
             try:
                 stamp = float(stamp)
@@ -258,7 +298,7 @@ class BarrierMonitor:
                     raise ValueError("Camera image is stale")
                 if not aligned:
                     raise ValueError("Camera alignment is unavailable")
-                gray = _gray(frameRGB)
+                gray = gray if self._usable_gray(gray) else _gray(frameRGB)
             except (ValueError, TypeError, OverflowError):
                 self._aligned = False
                 self._frames.clear()
@@ -286,7 +326,9 @@ class BarrierMonitor:
             if self._reference is not None:
                 mask = np.zeros((HEIGHT, WIDTH), bool)
                 mask[40:295, 90:530] = True
-                matched, reason, _fit = _photometric(self._reference, gray, mask)
+                matched, reason, _fit = _photometric(
+                    self._reference, gray, mask,
+                    self._indices_for("view", self._reference, "view-window", mask))
                 if matched is None:
                     # The arms are recognised by correlation, which already
                     # ignores gain and offset, so a failed exposure fit must not
@@ -562,25 +604,32 @@ class BarrierMonitor:
             self._observations[identity] = self._blank("Barrier references reset")
             return {"ok": True, "reason": "Barrier references reset", "status": self.status()}
 
-    def road_clear(self, frameRGB, route_mask):
+    def road_clear(self, frameRGB, route_mask, gray=None, cache_key=None):
         with self._lock:
             result = {"clear": False, "matched_fraction": 0., "reason": "Frozen empty-road reference unavailable"}
             if not self._road_reference or not self._fresh():
                 return result
             try:
-                current = _gray(frameRGB)
-                mask = np.asarray(route_mask)
-                if mask.ndim != 2 or not np.isfinite(mask).all():
-                    raise ValueError("Invalid route mask")
-                mask = cv2.resize((mask != 0).astype(np.uint8), (WIDTH, HEIGHT), interpolation=cv2.INTER_NEAREST)
+                current = gray if self._usable_gray(gray) else _gray(frameRGB)
+                cached = self._road_mask_cache.get(cache_key) if cache_key is not None else None
+                if cached is not None and cached[0] is route_mask and cached[1] is self.lines:
+                    mask = cached[2]
+                else:
+                    mask = np.asarray(route_mask)
+                    if mask.ndim != 2 or not np.isfinite(mask).all():
+                        raise ValueError("Invalid route mask")
+                    mask = cv2.resize((mask != 0).astype(np.uint8), (WIDTH, HEIGHT),
+                                      interpolation=cv2.INTER_NEAREST)
+                    for lines in self.lines.values():
+                        for line in lines.values():
+                            points = np.round(np.asarray(line)*(WIDTH, HEIGHT)).astype(int)
+                            cv2.line(mask, tuple(points[0]), tuple(points[1]), 0, 19)
+                    mask = mask.astype(bool)
+                    if cache_key is not None:
+                        self._road_mask_cache[cache_key] = (route_mask, self.lines, mask)
             except (ValueError, TypeError, cv2.error):
                 result["reason"] = "Valid current road image and mask required"
                 return result
-            for lines in self.lines.values():
-                for line in lines.values():
-                    points = np.round(np.asarray(line)*(WIDTH, HEIGHT)).astype(int)
-                    cv2.line(mask, tuple(points[0]), tuple(points[1]), 0, 19)
-            mask = mask.astype(bool)
             if np.count_nonzero(mask) < 100:
                 result["reason"] = "Route mask has too little visible road"
                 return result
@@ -589,7 +638,10 @@ class BarrierMonitor:
             # match speaks: one era of light must not make "clear" impossible.
             best = None
             for reference in self._road_reference:
-                normalized, reason, fit = _photometric(reference, current, mask)
+                normalized, reason, fit = _photometric(
+                    reference, current, mask,
+                    self._indices_for(("road", cache_key, id(reference)), reference, mask, mask)
+                    if cache_key is not None else False)
                 if normalized is None or fit is None or not (.75 <= fit[0] <= 1.35 and abs(fit[1]) <= 25):
                     reason = reason if normalized is None else "Road illumination is outside the empty reference"
                     if best is None:

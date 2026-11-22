@@ -109,6 +109,7 @@ let active=true,stateController=null,liveState={},connectionOk=false,lastStateAt
 let historyPoints=[],lastHistoryFrame=null,lastEventVersion=1,lastEventsAt=1000;
 let pending=[],renders=0,timers=[],cleared=[];
 const performance={now:()=>1000},finite=Number.isFinite;
+const document={hidden:false};
 const setTimeout=(fn,ms)=>{timers.push([fn,ms]);return timers.length};const clearTimeout=id=>cleared.push(id);
 const getJSON=()=>new Promise((resolve,reject)=>pending.push({resolve,reject}));
 const render=()=>renders++;const readEvents=()=>{},maybeReloadForUpdate=()=>{};
@@ -122,7 +123,7 @@ pending[1].resolve({frames:22,alerts_version:1});await latest;
 pending[0].resolve({frames:11,alerts_version:1});await old;
 assert.equal(liveState.frames,22);assert.equal(renders,1);
 assert.equal(connectionOk,true,'A successful state response must remain connected');
-assert.equal(timers.filter(([,ms])=>ms===600).length,1,'Only the current request schedules its successor');
+assert.equal(timers.filter(([,ms])=>ms===250).length,1,'Only the current request schedules its successor');
 """)
 
     def test_frame_decode_timeout_releases_polling_and_discards_the_late_image(self):
@@ -130,7 +131,7 @@ assert.equal(timers.filter(([,ms])=>ms===600).length,1,'Only the current request
             "async function readFrame(", "document.querySelectorAll('[data-page]')")
         self.js("""
 let active=true,frameRunning=false,frameController=null,displayedFrame='blob:initial',lastFrameAt=1000;
-let page='monitor',mode='live',connectionOk=true,now=1000,fetches=0;
+let page='live',mode='live',connectionOk=true,now=1000,fetches=0;
 const performance={now:()=>now},timers=[],revoked=[],decodes=new Map(),nodes=new Map();
 const setTimeout=(fn,ms)=>{timers.push([fn,ms]);return timers.length};const clearTimeout=()=>{};
 const transport={path:p=>p},fetch=async()=>({ok:true,blob:async()=>({id:++fetches})});
@@ -166,7 +167,7 @@ assert.equal(revoked.filter(url=>url==='blob:1').length,1);
 let active=true,frameRunning=false,frameController=null,stateController=null,configurationTimer=null;
 const stopVehicleStatus=()=>{};
 let displayedFrame='blob:initial',lastFrameAt=1000,lastStateAt=1000,lastAckAt=1000;
-let page='monitor',mode='live',connectionOk=true,now=1000,fetches=0;
+let page='live',mode='live',connectionOk=true,now=1000,fetches=0;
 const performance={now:()=>now},timers=[],revoked=[],decodes=new Map(),listeners={},nodes=new Map();
 const setTimeout=(fn,ms)=>{timers.push([fn,ms]);return timers.length};const clearTimeout=()=>{};
 const transport={path:p=>p},fetch=async()=>({ok:true,blob:async()=>({id:++fetches})});

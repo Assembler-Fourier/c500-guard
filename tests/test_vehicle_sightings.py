@@ -1,4 +1,4 @@
-"""Clean pictures of followed vehicles for the separate car memory (authorised 15 Nov 2026)."""
+"""Clean pictures of followed vehicles for the separate car memory."""
 import json
 import os
 from pathlib import Path

@@ -206,6 +206,34 @@ def maximise(hwnds) -> None:
         user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
 
 
+CAPTION_RGB = (0x09, 0x0c, 0x10)        # the app's own background
+CAPTION_TEXT_RGB = (0xc9, 0xd1, 0xd9)
+
+
+def dark_title_bar(hwnd: int) -> bool:
+    """Draw a window's title bar in the app's dark colours instead of white (Windows 11; display only)."""
+    try:
+        dwm = ctypes.WinDLL("dwmapi")
+    except OSError:
+        return False
+    ok = True
+    for attribute, colour in ((20, None), (35, CAPTION_RGB), (36, CAPTION_TEXT_RGB), (34, CAPTION_RGB)):
+        value = ctypes.c_uint32(1 if colour is None else colour[0] | (colour[1] << 8) | (colour[2] << 16))
+        try:
+            ok = dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), attribute, ctypes.byref(value), 4) == 0 and ok
+        except OSError:
+            ok = False
+    return ok
+
+
+def style_new_windows(styled: set) -> None:
+    """Give every app window that appeared since the last check its dark title bar, once."""
+    for hwnd in app_windows():
+        if hwnd not in styled:
+            styled.add(hwnd)
+            dark_title_bar(hwnd)
+
+
 def bring_forward(hwnd: int) -> None:
     """Like clicking a running app's icon: un-minimise it, maximise it and put it in front."""
     user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -369,12 +397,28 @@ def run_with_splash(title: str, line: str, work) -> object:
 
 
 # ---------------------------------------------------------------- the three actions
+STARTING = ("Starting…", "Checking the camera, AI and helpers. This usually takes 20–40 seconds.")
+
+
+def startup_hint(state: dict | None) -> tuple[str, str, str]:
+    """What the operator can fix while starting; starting carries on by itself once it is fixed."""
+    alignment = (state or {}).get("alignment") or {}
+    if alignment.get("state") == "keyboard_menu":
+        return ("Make the camera full-screen",
+                "The CCTV keyboard is showing its Live View menu bar across the picture. Open PTZ 2 or ANPR Entrance "
+                "full-screen on the keyboard - starting carries on by itself.", RED)
+    if state is not None and not state.get("frames"):
+        return ("Starting…", "Waiting for the first picture from the capture stick.", LIME)
+    return (*STARTING, LIME)
+
+
 def start_system(splash: Splash) -> bool:
-    """True when the system is up and armed (or at least answering)."""
+    """Reuse a responding service; a new start must finish the controller's health checks."""
+    if system_state() is not None:
+        return True
     while True:
-        if system_state() is not None:
-            return True
         splash.say("Starting…", "Checking the camera, AI and helpers. This usually takes 20–40 seconds.")
+        previous_request = receipt().get("request_id")
         started = time.time()
         if not run_task(ON_TASK):
             choice = splash.ask("Could not start", "Windows could not start the power task. It may need repair.",
@@ -383,21 +427,38 @@ def start_system(splash: Splash) -> bool:
                 continue
             return False
         time.sleep(4)
+        shown = None
+        finished = False
+        state = None
         while time.time() - started < 150:
             state = system_state()
-            if state is not None and state.get("armed"):
-                return True
+            hint = startup_hint(state)
+            if hint != shown:
+                splash.say(*hint)
+                shown = hint
             if time.time() - started > 8 and task_status(ON_TASK) not in ("Running", "Queued"):
-                if state is not None:
-                    return True
+                finished = True
                 break
             time.sleep(1)
         info = receipt()
-        problem = "; ".join(info.get("errors") or []) or "It did not answer in time."
+        # /arm answers before the controller checks inference in the new detector epoch.
+        # Opening the native window early would lose this splash if that final check fails
+        # and failed-ON cleanup closes the window. A prior successful ON is not this attempt.
+        fresh = bool(info.get("request_id")) and info.get("request_id") != previous_request
+        off_requested = switched_off() or (fresh and info.get("action") == "off")
+        if (finished and fresh and info.get("action") == "on" and info.get("ok") is True
+                and info.get("complete") is True and info.get("power_state") == "on"
+                and state is not None and not off_requested):
+            return True
+        if off_requested:
+            problem = "An OFF request cancelled startup."
+        else:
+            errors = info.get("errors") if fresh or not info.get("request_id") else []
+            problem = "; ".join(errors or []) or "The power task did not confirm a completed startup."
         log(f"start failed: {problem}")
         choice = splash.ask("Did not start",
-                            f"{problem}\nCheck the capture stick is plugged in and the keyboard shows the ANPR "
-                            "Entrance camera.", [("retry", "Try again"), ("close", "Close")])
+                            f"{problem}\nCheck the capture stick is plugged in and the keyboard shows ANPR Entrance "
+                            "or PTZ 2 full-screen (no menu bar across the top).", [("retry", "Try again"), ("close", "Close")])
         if choice != "retry":
             return False
 
@@ -416,9 +477,11 @@ def watch_exe_window(page: str) -> bool:
     log(f"window open (BarrierWatcher.exe pid {window.pid}) {page}")
     car_memory = start_car_memory()
     away_since = None
+    styled = set()
     try:
         while True:
             time.sleep(1.0)
+            style_new_windows(styled)
             code = window.poll()
             if code is not None:
                 if code != 0 and time.time() - started < 15:

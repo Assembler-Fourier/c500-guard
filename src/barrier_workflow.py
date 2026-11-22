@@ -4,7 +4,9 @@ No hardware controls, audio writes, input hooks or extra worker live here.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
+import copy
 import json
 import math
 import threading
@@ -48,6 +50,10 @@ class BarrierWorkflow:
         self._trusted = False
         self._last_stamp = None
         self._enabled = False
+        self._observation_interrupted = threading.Event()
+        self._operation = None
+        self._snapshot_valid = False
+        self._status_snapshot = (None, {'configured': False, 'barriers': []})
         # Self-learning: a confidently read arm whose match has drifted with
         # the light is saved as another lighting example (max 4 per position;
         # the closest is replaced after that). Never with anything in the lanes.
@@ -96,12 +102,31 @@ class BarrierWorkflow:
 
     def observe(self, frame, stamp, primary, zones, alignment_ok, alarm=None,
                 pending_routes=(), enabled=True):
-        now = self.clock()
-        with self._lock:
+        # Manual calibration saves compressed references while holding this
+        # lock. A slow disk must not hold the camera/alarm loop behind that
+        # user action. Missing evidence is unknown until a new observation.
+        if not self._lock.acquire(blocking=False):
+            self._observation_interrupted.set()
+            return []
+        try:
+            now = self.clock()
+            if self._observation_interrupted.is_set():
+                self._snapshot_valid = False
+                self.cycles.reset()
+                self._observation_interrupted.clear()
             self._enabled = bool(enabled)
             self._trusted = bool(alignment_ok and fresh(stamp, now))
+            if not self._trusted:
+                self._snapshot_valid = False
             self._last_stamp = stamp
-            self.monitor.update(frame, stamp, aligned=self._trusted)
+            self._operation = 'observe'
+            # One grey conversion per frame, shared by the arm reading and every lane's road check.
+            shared = getattr(self.monitor, 'SHARED_GRAY', False) is True
+            gray = self.monitor.prepare_gray(frame) if shared else None
+            if shared:
+                self.monitor.update(frame, stamp, aligned=self._trusted, gray=gray)
+            else:
+                self.monitor.update(frame, stamp, aligned=self._trusted)
             status = self.monitor.status()
             primary = primary if isinstance(primary, dict) else {}
             model_stamp = primary.get('observed_at')
@@ -142,7 +167,9 @@ class BarrierWorkflow:
                     occupancy = 'occupied'
                     observed_at = stamp if image_present else model_stamp
                 elif ready:
-                    road = self.monitor.road_clear(frame, self._mask(route, members, frame.shape[:2]))
+                    route_mask = self._mask(route, members, frame.shape[:2])
+                    road = (self.monitor.road_clear(frame, route_mask, gray=gray, cache_key=route) if shared
+                            else self.monitor.road_clear(frame, route_mask))
                     if road.get('clear') is True:
                         occupancy, observed_at = 'clear', min(stamp, model_stamp)
                 observations[route] = {
@@ -161,12 +188,39 @@ class BarrierWorkflow:
                                         'barrier_reason': arm.get('reason') or (
                                             'Physical barrier mapped to this lane' if arm else
                                             'No physical barrier controls this route')}
-            if ready and not detections:
+            # The model can miss a vehicle whose lights/motion already prove
+            # activity. Never learn its image as a quiet lighting reference.
+            learning_now = self.clock()
+            if (ready and fresh(stamp, learning_now) and fresh(model_stamp, learning_now)
+                    and not detections and not alarm and not pending_routes
+                    and not any(z.motion_active or z.light_active for z in zones)):
                 self._learn_arms(status, now)
-            if not enabled:
+            # Monitor work or a self-learned save can outlive the image. Use
+            # the completion clock, not the time before those operations, for
+            # every service intent and its model freshness checks.
+            now = self.clock()
+            if not fresh(stamp, now) or self._observation_interrupted.is_set():
+                self._trusted = False
+                self._snapshot_valid = False
                 self.cycles.reset()
                 return []
-            return self.cycles.update(observations, alarm=alarm, now=now)
+            if not fresh(model_stamp, now):
+                for observation in observations.values():
+                    observation['model_ready'] = False
+            if not enabled:
+                self.cycles.reset()
+                self._publish_snapshot(self._build_status())
+                return []
+            intents = self.cycles.update(observations, alarm=alarm, now=now)
+            self._publish_snapshot(self._build_status())
+            return intents
+        except Exception:
+            self._trusted = self._snapshot_valid = False
+            self._observation_interrupted.set()
+            raise
+        finally:
+            self._operation = None
+            self._lock.release()
 
     LEARN_EVERY_S = 1800.
     # A reading this sure, unchanged for a full minute with both strips
@@ -258,7 +312,7 @@ class BarrierWorkflow:
 
     def undo_last_learning(self):
         """Put back the references as they were before the latest self-learned example."""
-        with self._lock:
+        with self._operation_lock('undo'):
             path = getattr(self.monitor, 'storage_path', None)
             if not isinstance(path, (str, os.PathLike)):
                 return {'ok': False, 'reason': 'Barrier references are not stored'}
@@ -281,18 +335,79 @@ class BarrierWorkflow:
                     'reason': 'The latest learned barrier example was removed'}
 
     def status(self):
-        now = self.clock()
-        with self._lock:
-            result = self.monitor.status()
-            current = self._trusted and fresh(self._last_stamp, now)
-            cycle = self.cycles.status(now=now)
-            result['service'] = cycle
-            result['road_readings'] = {route: dict(value) for route, value in self._readings.items()}
-            result['last_resolution'] = self._last_resolution
-            result['reminder_active'] = bool(self._enabled and current and any(
-                state.get('reminder_active') for state in cycle.get('routes', {}).values()))
-            result['trusted'] = current
+        if not self._lock.acquire(blocking=False):
+            return self._contended_status()
+        try:
+            if self._observation_interrupted.is_set():
+                return self._unavailable_status()
+            result = self._build_status()
+            if self._operation is None:
+                self._publish_snapshot(result)
             return result
+        finally:
+            self._lock.release()
+
+    def _build_status(self):
+        now = self.clock()
+        result = self.monitor.status()
+        current = self._trusted and fresh(self._last_stamp, now)
+        cycle = self.cycles.status(now=now)
+        result['service'] = cycle
+        result['road_readings'] = {route: dict(value) for route, value in self._readings.items()}
+        result['last_resolution'] = self._last_resolution
+        result['reminder_active'] = bool(self._enabled and current and any(
+            state.get('reminder_active') for state in cycle.get('routes', {}).values()))
+        result['trusted'] = current
+        return result
+
+    def _publish_snapshot(self, result):
+        # Publish source time and data together, after all service work. Readers
+        # must never pair an old reading with the in-flight frame's timestamp.
+        self._status_snapshot = (self._last_stamp, copy.deepcopy(result))
+        self._snapshot_valid = result.get('trusted') is True
+
+    def _contended_status(self):
+        now = self.clock()
+        stamp, saved = self._status_snapshot
+        if (self._operation != 'observe' or not self._snapshot_valid or not self._trusted
+                or self._observation_interrupted.is_set() or not fresh(stamp, now)):
+            return self._unavailable_status()
+        # Ordinary image analysis may use the last completed position for the
+        # display. It cannot replay service evidence or authorize an ACK while
+        # the newer observation is still being assembled.
+        result = copy.deepcopy(saved)
+        for row in result.get('barriers', []):
+            if not fresh(row.get('observed_at'), now):
+                self._unknown_row(row)
+        result.update(trusted=False, reminder_active=False, road_readings={},
+                      service={'routes': {}}, busy=True, cached=True)
+        return result
+
+    @staticmethod
+    def _unknown_row(row):
+        row.update(state='unknown', confidence=0., fresh=False, up_for_s=0.,
+                   active_line=None, candidate_position=None, confirmation_s=0.,
+                   reason='Waiting for fresh completed barrier observations')
+
+    def _unavailable_status(self):
+        """Keep setup geometry visible without lending cached state to an ACK."""
+        result = copy.deepcopy(self._status_snapshot[1])
+        for row in result.get('barriers', []):
+            self._unknown_row(row)
+        result.update(trusted=False, reminder_active=False, road_readings={},
+                      service={'routes': {}}, busy=True)
+        return result
+
+    @contextmanager
+    def _operation_lock(self, operation):
+        with self._lock:
+            previous = self._operation
+            self._operation = operation
+            self._snapshot_valid = False
+            try:
+                yield
+            finally:
+                self._operation = previous
 
     def resolved(self, intent):
         with self._lock:
@@ -304,7 +419,7 @@ class BarrierWorkflow:
             return self.cycles.mute_reminders(self.clock())
 
     def reset(self):
-        with self._lock:
+        with self._operation_lock('reset'):
             self.cycles.reset()
             self._trusted = False
             self._enabled = False
@@ -316,7 +431,7 @@ class BarrierWorkflow:
         if payload.get('action') == 'capture-road':
             # The empty road in this hour's light, so "the car has gone" can be
             # recognised outside the conditions of the first calibration.
-            with self._lock:
+            with self._operation_lock('calibration'):
                 if not self._trusted or not fresh(self._last_stamp, self.clock()):
                     raise ValueError('A fresh, verified camera view is required')
                 result = self.monitor.capture_road()
@@ -326,7 +441,7 @@ class BarrierWorkflow:
         if payload.get('id') not in ('exit', 'entrance'):
             raise ValueError('Choose the exit or entrance barrier')
         action, ident = payload.get('action'), payload['id']
-        with self._lock:
+        with self._operation_lock('calibration'):
             if action == 'capture':
                 if payload.get('position') not in ('up', 'down'):
                     raise ValueError('Choose UP or DOWN')

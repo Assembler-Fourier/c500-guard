@@ -66,7 +66,6 @@ assert.equal(acknowledgementHint({last_ack:ack},{...status,alarmActive:true}),'A
 for(const last_ack of [null,{...ack,via:'barrier-raised'},{...ack,at:'bad'},{...ack,alarm_id:null}]){
  assert.equal(acknowledgementHint({last_ack},status),'Same visit stays acknowledged');
 }
-mode='quiet';assert.equal(acknowledgementHint({last_ack:ack},status),'Same visit stays acknowledged');
 """)
 
 

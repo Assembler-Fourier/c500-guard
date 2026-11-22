@@ -26,7 +26,7 @@ assert.equal(vehicleStatusPresentation(null).tone,'warn');
 
     def test_vehicle_refresh_is_visible_bounded_serial_and_does_not_reload_frame(self):
         self.js("""
-let active=true,page='cars',calls=0;const document={hidden:false},location={origin:'http://local'};
+let active=true,page='vehicles',calls=0;const document={hidden:false},location={origin:'http://local'};
 const timers=new Map();let next=0;const setTimeout=(fn,ms)=>{timers.set(++next,{fn,ms});return next},clearTimeout=id=>timers.delete(id);
 const nodes=new Map(),messages=[];const $=id=>{if(!nodes.has(id))nodes.set(id,{contentWindow:{postMessage:(...args)=>messages.push(args)}});return nodes.get(id)};
 const good={available:true,updater_alive:true,updater_state:'ready',stale:false,report_version:'1'};
@@ -38,36 +38,35 @@ resolve(good);await first;assert.equal(messages.length,1);assert.equal(messages[
 assert.equal([...timers.values()].filter(t=>t.ms===5000).length,1);assert.equal('src' in $('cars-frame'),false);
 let request=readVehicleStatus();resolve(good);await request;assert.equal(messages.length,1,'Unchanged reports must not refresh');
 request=readVehicleStatus();resolve({...good,report_version:'2'});await request;assert.equal(messages.length,2);
-request=readVehicleStatus();stopVehicleStatus();page='monitor';resolve({...good,report_version:'3'});await request;
+request=readVehicleStatus();stopVehicleStatus();page='live';resolve({...good,report_version:'3'});await request;
 assert.equal(messages.length,2,'A response after navigation cannot touch the report');assert.equal(timers.size,0);
-await readVehicleStatus();assert.equal(calls,4);page='cars';document.hidden=true;await readVehicleStatus();assert.equal(calls,4);
+await readVehicleStatus();assert.equal(calls,4);page='vehicles';document.hidden=true;await readVehicleStatus();assert.equal(calls,4);
 """)
 
     def test_camera_setup_keeps_fresh_good_guidance_visible_and_hides_stale(self):
         harness = view_status.DashboardViewStatusTests.framing_harness(self)
-        self.js("let page='system';\n" + harness + """
+        self.js("let page='setup',setupTab='camera';\n" + harness + """
 const currentSetup={alignment:{framing:{state:'good',primary:'good',headline:'Camera framing good',text:'Current view',fit_pct:98}}};
 renderFraming(currentSetup,status);now+=16000;lastStateAt=lastFrameAt=now;renderFraming(currentSetup,status);assert.equal(box.hidden,false);
 connectionOk=false;renderFraming(currentSetup,status);assert.equal(box.hidden,true);
 """)
-        self.assertIn('id="open-camera-setup" class="tool-button" data-go="system"', self.page)
-        self.assertIn('camera-setup-empty', self.page)
+        # The live warning bar links straight to Setup > Camera.
+        self.assertIn('data-go="setup" data-setup="camera"', self.page)
 
-    def test_explicit_barrier_close_resets_accessible_disclosure(self):
-        close = 'function closeBarrierDrawer(' + self.source('function closeBarrierDrawer(', "$('open-barriers').addEventListener")
-        # Only take the close helper; later close listeners are tested by the drawer module.
-        close = close.split('\n', 1)[0]
-        self.js("""
-const values=[],dialog={open:true,close(){this.open=false}},$=id=>id==='barrier-drawer'?dialog:{setAttribute:(...args)=>values.push(args)};
-""" + close + """
-closeBarrierDrawer();assert.equal(dialog.open,false);assert.deepEqual(values,[['aria-expanded','false']]);
-""")
+    def test_setup_sections_are_accessible_tabs(self):
+        # The barrier drawer became Setup > Barriers: tabs announce their selection and own their panels.
+        for tab in ('camera', 'zones', 'barriers'):
+            self.assertRegex(self.page, r'role="tab" data-setup-tab="%s"[^>]*aria-selected="(?:true|false)"' % tab)
+            self.assertRegex(self.page, r'<section id="setup-%s" class="setup-panel" role="tabpanel"' % tab)
+        choose = 'function chooseSetupTab(' + self.source('function chooseSetupTab(', 'function navigate(')
+        self.assertIn("b.setAttribute('aria-selected',String(on))", choose)
+        self.assertIn("editor.deactivate()", choose)
 
     def test_setup_preview_reuses_current_frame_only_while_system_visible(self):
         context='function barrierContext('+self.source('function barrierContext(', 'function renderBarrierInspection(')
         preview='function renderSetupPreview('+self.source('function renderSetupPreview(', '// SETUP_PREVIEW_END')
         self.js("""
-let page='system',mode='live',connectionOk=true,shutdownRequested=false,now=1000,lastStateAt=1000,lastFrameAt=1000,displayedFrame='blob:current';
+let page='setup',setupTab='camera',setupPreviewMode='aligned',mode='live',connectionOk=true,shutdownRequested=false,now=1000,lastStateAt=1000,lastFrameAt=1000,displayedFrame='blob:current';const setupVisible=tab=>page==='setup'&&setupTab===tab;
 const performance={now:()=>now},nodes=new Map();
 const $=id=>{if(!nodes.has(id))nodes.set(id,{src:null,innerHTML:'',hidden:false,textContent:'',attributes:new Set(['hidden']),toggleAttribute(name,value){if(value)this.attributes.add(name);else this.attributes.delete(name)},getAttribute(name){return this[name]},removeAttribute(name){delete this[name]}});return nodes.get(id)};
 $('route-overlay').innerHTML='<path d="saved geometry"/>';$('feed').src='blob:main';
@@ -76,26 +75,26 @@ const state={},status={cameraFresh:true,aligned:true};
 renderSetupPreview(state,status);assert.equal($('setup-feed').src,'blob:current');assert.equal($('setup-feed').hidden,false);
 assert.equal($('setup-overlay').innerHTML,$('route-overlay').innerHTML);assert.equal($('feed').src,'blob:main','Main image ownership is untouched');
 assert.equal($('setup-overlay').attributes.has('hidden'),false,'SVG visibility must change its attribute, not an HTMLElement-only property');
-page='monitor';renderSetupPreview(state,status);assert.equal($('setup-feed').hidden,true);assert.equal($('setup-feed').src,undefined);assert.equal($('setup-overlay').innerHTML,'');
+page='live';renderSetupPreview(state,status);assert.equal($('setup-feed').hidden,true);assert.equal($('setup-feed').src,undefined);assert.equal($('setup-overlay').innerHTML,'');
 assert.equal($('setup-overlay').attributes.has('hidden'),true);
 displayedFrame='blob:newer';renderSetupPreview(state,status);assert.equal($('setup-feed').src,undefined,'No hidden preview updates');
-page='system';renderSetupPreview(state,{cameraFresh:true,aligned:false});assert.equal($('setup-feed').src,'blob:newer');assert.match($('setup-preview-caption').textContent,/alignment needs attention/);
+page='setup';renderSetupPreview(state,{cameraFresh:true,aligned:false});assert.equal($('setup-feed').src,'blob:newer');assert.match($('setup-preview-caption').textContent,/alignment needs attention/);
 $('route-overlay').innerHTML='';renderSetupPreview(state,status);assert.equal($('setup-overlay').attributes.has('hidden'),true);assert.match($('setup-preview-caption').textContent,/outlines unavailable/);
-for(const bad of ['state','picture','offline','preview']){
+for(const bad of ['state','picture','offline']){
  now=1000;lastStateAt=lastFrameAt=1000;connectionOk=true;mode='live';
- if(bad==='state')now=2800;if(bad==='picture')lastFrameAt=-4000;if(bad==='offline')connectionOk=false;if(bad==='preview')mode='alarm';
+ if(bad==='state')now=2800;if(bad==='picture')lastFrameAt=-4000;if(bad==='offline')connectionOk=false;
  renderSetupPreview(state,status);assert.equal($('setup-feed').hidden,true,bad);assert.equal($('setup-feed').src,undefined,bad);assert.equal($('setup-overlay').innerHTML,'',bad);
 }
 """)
         for operation in ('fetch(', 'setInterval(', 'setTimeout(', 'new Image', 'createObjectURL', 'revokeObjectURL'):
             self.assertNotIn(operation,preview)
         frame='async function readFrame('+self.source('async function readFrame(', "document.querySelectorAll('[data-page]')")
-        self.assertIn("if(page==='system'){renderSetupPreview(s,status);renderFraming(s,status);}",frame)
+        self.assertIn("if(page==='setup'&&setupTab==='camera'){renderSetupPreview(s,status);renderFraming(s,status);}",frame)
         self.assertEqual(frame.count('fetch('),1,'One shared frame request, never another camera reader')
 
     def test_system_preview_and_guidance_share_picture_expiry(self):
         harness=view_status.DashboardViewStatusTests.framing_harness(self)
-        self.js("let page='system';\n"+harness+"""
+        self.js("let page='setup',setupTab='camera';\n"+harness+"""
 renderFraming(good,status);assert.equal(box.hidden,false);
 now+=5000;lastStateAt=now;renderFraming(good,status);assert.equal(box.hidden,true,'Fresh state cannot renew an expired displayed picture');
 lastFrameAt=now;renderFraming(good,status);assert.equal(box.hidden,false);

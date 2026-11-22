@@ -113,6 +113,7 @@ def reset_configuration() -> None:
     _settings.update(_TIERS)
     _start[0] = START_LEVEL
     set_theme(DEFAULT_THEME)
+    set_reminder_period(_REMINDER_DEFAULT)
 
 
 def settings() -> dict:
@@ -236,6 +237,23 @@ def _set_lane_profiles(profile: str) -> None:
         PROFILE_HARMONICS[name] = PROFILE_HARMONICS[profile]
 
 
+_REMINDER_DEFAULT = 15.0
+_reminder_period = [_REMINDER_DEFAULT]
+
+
+def reminder_period() -> float:
+    return _reminder_period[0]
+
+
+def set_reminder_period(seconds) -> float:
+    """The arm-left-up beep repeats with its sound file, so the file follows the configured interval (10..600 s)."""
+    value = _number(seconds)
+    period = _REMINDER_DEFAULT if value is None or isinstance(seconds, bool) else min(600.0, max(10.0, float(value)))
+    PROFILES["barrier_open"] = (period, PROFILES["barrier_open"][1])
+    _reminder_period[0] = period
+    return period
+
+
 def set_theme(name) -> str:
     """Select a sound style. Unknown names keep the original pulses."""
     chosen = name if isinstance(name, str) and name in THEMES else DEFAULT_THEME
@@ -298,7 +316,8 @@ def plan(elapsed_s: float, *, kind: str = "main", source: str = "unknown",
          presence_state: str = "unknown", evidence_fresh: bool = True,
          event_present: bool = True, acknowledged: bool = False,
          quiet_remaining_s: float = 0.0, enabled: bool = True,
-         confirmed: bool = False, urgent: bool = False) -> AudioPlan:
+         confirmed: bool = False, urgent: bool = False,
+         pedestrian_latched: bool = False) -> AudioPlan:
     """Return an alarm plan without side effects.
 
     ``confirmed`` must come from current vehicle/person evidence, never from
@@ -306,6 +325,9 @@ def plan(elapsed_s: float, *, kind: str = "main", source: str = "unknown",
     evidence and continued event presence are required for every repeat and
     every escalation. Missing evidence stops sound while the watcher may keep
     the visual incident open. The initial short pulse needs no AI confirmation.
+
+    ``pedestrian_latched`` is an explicit manual-acknowledgement incident;
+    it may repeat after evidence clears without claiming current occupancy.
 
     Presence does not change timing or strength. It cannot acknowledge a
     visit, increase an evidence grade, or prevent an unanswered reminder.
@@ -326,6 +348,16 @@ def plan(elapsed_s: float, *, kind: str = "main", source: str = "unknown",
     if elapsed is None:
         return _silent("unavailable", "Alarm timer is unavailable")
     elapsed = max(0.0, elapsed)
+    # A latched, validated pedestrian incident needs operator attention; it
+    # does not claim that the person is still in the picture. ACK/quiet/OFF
+    # and the separate speaker-failure fallback remain authoritative.
+    if pedestrian_latched and kind in ("main", "early"):
+        ceiling = level_ceiling(confirmed=True)
+        start = min(.60, ceiling)
+        fraction = math.expm1(-1.2 * min(elapsed, 4.) / 4.) / math.expm1(-1.2)
+        level = start + (ceiling-start) * fraction
+        return _audible("notice" if elapsed < 2. else "wake", level,
+                        "pedestrian_ack", "Pedestrian alert; acknowledge to stop")
     if not event_present:
         return _silent("cleared", "The current event is no longer present")
     if not evidence_fresh:
@@ -440,6 +472,8 @@ def ensure_sounds(directory: Path | str, force: bool = False) -> dict[str, Path]
     paths = {name: directory / f"attention-{name}.wav" for name in PROFILES}
     stamp = directory / ".attention-version"
     version = SOUND_VERSION if _theme[0] == DEFAULT_THEME else f"{SOUND_VERSION}:{_theme[0]}"
+    if _reminder_period[0] != _REMINDER_DEFAULT:
+        version += f":reminder-{_reminder_period[0]:g}s"
     try:
         current = stamp.read_text(encoding="ascii").strip()
     except (OSError, UnicodeError):

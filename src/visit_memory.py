@@ -361,7 +361,7 @@ class VisitMemory:
                 'acknowledged visit' if visit.acknowledged else 'already announced visit' if visit.emitted else 'new visit', matched)
 
     def continue_unanswered(self, visit_id, alarm_id, previous, details, zones, now):
-        """Continue an opt-in advance warning at its barrier, without restarting it.
+        """Continue an unanswered approach through a proven short identity break.
 
         This narrow association applies only to the alarm still sounding. It
         never extends acknowledged-visit identity or joins a known visible
@@ -370,10 +370,13 @@ class VisitMemory:
         with self._lock:
             self._time(now)
             visit = self._visits.get(visit_id)
+            same_advance = (previous.get('alert_stage') == details.get('alert_stage') == 'advance'
+                            and previous.get('zone_name') == details.get('zone_name'))
             if (not visit or not visit.emitted or visit.acknowledged
                     or str(alarm_id) != self._current_alarm_id or str(alarm_id) not in visit.alarm_ids
                     or previous.get('source') != 'ai' or details.get('source') != 'ai'
-                    or previous.get('alert_stage') != 'advance' or details.get('alert_stage') != 'barrier'
+                    or previous.get('alert_stage') != 'advance'
+                    or (details.get('alert_stage') != 'barrier' and not same_advance)
                     or self.route_key(previous) != visit.route or self.route_key(details) != visit.route
                     or not self._valid_candidate(details)):
                 return None
@@ -381,6 +384,10 @@ class VisitMemory:
             if (not _number(stamp) or not 0 <= now-stamp < self.freshness_s
                     or not _number(first) or not visit.last_seen < first <= stamp
                     or not 0 <= now-visit.last_seen <= min(8.,self.reidentify_s)):
+                return None
+            # Same-region fragments must start just after the last real sighting.
+            # The longer existing barrier handoff remains separately bounded.
+            if same_advance and first-visit.last_seen > .75:
                 return None
             # A fresh road-clear interval completed before this new track first
             # appeared proves a new arrival, not an occluded continuation.
@@ -397,7 +404,10 @@ class VisitMemory:
             window = _get(approach,'ai_confirmation_window_s',0)
             if (approach is None or barrier is None or not _number(window) or not 0 < window <= 1.5
                     or self.route_key(approach) != visit.route or self.route_key(barrier) != visit.route
-                    or _get(approach,'alert_stage') != 'advance' or _get(barrier,'alert_stage') != 'barrier'):
+                    or _get(approach,'alert_stage') != 'advance'
+                    or (_get(barrier,'alert_stage') != 'barrier' and not same_advance)):
+                return None
+            if same_advance and (approach is not barrier or _get(approach,'ai_context') is not True):
                 return None
             confidence = details.get('confidence')
             observations = details.get('observations')
@@ -451,6 +461,19 @@ class VisitMemory:
             for zone,point in ((approach,a),(barrier,b)):
                 contains = _get(zone,'contains_point')
                 if not callable(contains) or not contains(*point):
+                    return None
+            if same_advance:
+                # A real follower enters behind the old car. Its later forward
+                # motion must not disguise that separate birth as continuation.
+                origin = details.get('first_ground')
+                lateral_limit = max(.012,.25*min(math.hypot(aw,ah),math.hypot(bw,bh)))
+                if (not isinstance(origin,(list,tuple)) or len(origin)!=2
+                        or not all(_number(v) and 0 <= v <= 1 for v in origin)
+                        or not _get(approach,'contains_point')(*origin)
+                        or math.dist(a,origin) > min(.15,.55*(math.hypot(aw,ah)+math.hypot(bw,bh)))
+                        or ((origin[0]-a[0])*direction[0]+(origin[1]-a[1])*direction[1])/math.hypot(*direction) < minimum
+                        or any(abs((point[0]-a[0])*direction[1]-(point[1]-a[1])*direction[0])
+                               /math.hypot(*direction) > lateral_limit for point in (origin,b))):
                     return None
             gate = _get(barrier,'confirmation_polygon')
             if gate and not point_in_polygon(*b,gate):

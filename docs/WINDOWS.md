@@ -38,8 +38,8 @@ The historical `install.ps1` also supports the camera bridge. It requires a comp
 ## Troubleshooting
 
 - **Picture unavailable or old:** check the capture source, FFmpeg and acquisition age. Do not treat a cached browser image as current evidence.
-- **AI unavailable:** inspect System for model path, checksum, runtime and inference errors. The optional entrance check can be unavailable while the primary detector continues; the UI reports those separately.
-- **Alignment uncertain:** open Camera setup, inspect the current preview and restore the correct view. Guidance does not issue camera zoom or PTZ commands.
+- **AI unavailable:** inspect Health for model path, checksum, runtime and inference errors. The optional entrance check can be unavailable while the primary detector continues; the UI reports those separately.
+- **Alignment uncertain:** open Setup > Camera, inspect the current preview and restore the correct view. Guidance does not issue camera zoom or PTZ commands.
 - **Barrier unknown:** inspect the current arm evidence and calibration. Contradictory angle/background evidence intentionally prevents a confident state and automatic acknowledgement.
 - **Vehicles report stale:** inspect the report worker heartbeat and sighting status. An old report generation time alone can simply mean no new observations.
 - **No sound:** test the lane tone, OS output device and volume. A software test receipt does not prove that someone heard it.

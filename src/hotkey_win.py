@@ -40,6 +40,11 @@ import platform_support as ps
 
 # Virtual key codes
 VK_F4, VK_CONTROL, VK_MENU = 0x73, 0x11, 0x12
+VK_SHIFT, VK_LWIN, VK_RWIN = 0x10, 0x5B, 0x5C
+# Easy keys, by physical position: ` (below Esc) pauses/resumes, the full stop pauses. Both still type.
+SC_PAUSE_KEY, SC_DOT_KEY, SC_NUMPAD_DOT, LLKHF_EXTENDED = 0x29, 0x34, 0x53, 0x01
+# The number-pad "." (scan 0x53 without the extended flag; the separate Delete key has the flag) pauses too.
+EASY_KEYS = {SC_PAUSE_KEY: "toggle", SC_DOT_KEY: "pause", SC_NUMPAD_DOT: "pause"}
 WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
 WM_KEYDOWN, WM_SYSKEYDOWN = 0x0100, 0x0104
 WM_KEYUP, WM_SYSKEYUP = 0x0101, 0x0105
@@ -126,6 +131,7 @@ class Hotkey:
         self._mouse_hook = None
         self._last_fire = float("-inf")
         self._f4_down = False
+        self._easy_down = set()          # easy keys currently held
         self._requests = queue.Queue(maxsize=1)
         self._pending = threading.Event()
         self._stop = threading.Event()
@@ -171,12 +177,12 @@ class Hotkey:
         """All HTTP, sound, printing and file I/O stays off the hook thread."""
         while not self._stop.is_set():
             try:
-                self._requests.get(timeout=.25)
+                action = self._requests.get(timeout=.25)
             except queue.Empty:
                 continue
             try:
                 if not self._stop.is_set():
-                    self.toggle()
+                    self.pause() if action == "pause" else self.toggle()
             except Exception as exc:
                 # Keep the worker alive if a response/sound/logging path fails.
                 self.say(f"hotkey toggle failed: {exc}")
@@ -326,6 +332,18 @@ class Hotkey:
         except Exception:                                  # noqa: BLE001
             pass
 
+    def pause(self) -> None:
+        """The full-stop key: alerts off (stays off when already paused)."""
+        request = urllib.request.Request(self.api + "/disarm", method="POST",
+                                         headers={"X-Via": "hotkey-dot"})
+        try:
+            with urllib.request.urlopen(request, timeout=4) as response:
+                armed = json.load(response).get("armed")
+            self.say(f"full stop -> {'ON' if armed else 'OFF'}")
+            self.beep(bool(armed))
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self.say(f"watcher not reachable at {self.api}: {exc}")
+
     def toggle(self) -> None:
         request = urllib.request.Request(self.api + "/toggle", method="POST",
                                          headers={"X-Via": "hotkey"})
@@ -358,6 +376,7 @@ class Hotkey:
             # ctypes otherwise reports an ignored exception and has no defined
             # Python return value to pass back to Windows. Always forward.
             self._f4_down = False
+            self._easy_down.clear()
         return self._forward_input(self._hook, code, wparam, lparam)
 
     def _handle_key(self, code, wparam, lparam):
@@ -365,6 +384,16 @@ class Hotkey:
             data = ctypes.cast(lparam, ctypes.POINTER(self._KBD)).contents
             if data.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED):
                 return False
+            action = EASY_KEYS.get(data.scanCode) if not data.flags & LLKHF_EXTENDED else None
+            if action:
+                # Never swallowed: the character still types in the app in front.
+                if wparam in (WM_KEYUP, WM_SYSKEYUP):
+                    self._easy_down.discard(data.scanCode)
+                elif data.scanCode not in self._easy_down:
+                    self._easy_down.add(data.scanCode)
+                    if not any(self.user32.GetAsyncKeyState(vk) & 0x8000
+                               for vk in (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN)):
+                        self._queue_toggle(action)
             if data.vkCode == VK_F4:
                 if wparam in (WM_KEYUP, WM_SYSKEYUP):
                     if self._f4_down:
@@ -393,6 +422,17 @@ class Hotkey:
             if wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 self._queue_ack("input-any-key")
         return False
+
+    def _queue_toggle(self, action=True) -> None:
+        """Same debounce and single pending request as the Ctrl+Alt+F4 chord. Never blocks the hook."""
+        now = time.monotonic()
+        if now - self._last_fire > 0.5 and not self._pending.is_set():
+            self._pending.set()
+            try:
+                self._requests.put_nowait(action)
+                self._last_fire = now
+            except queue.Full:
+                self._pending.clear()
 
     def _on_mouse(self, code, wparam, lparam):
         try:
@@ -475,7 +515,7 @@ class Hotkey:
                 return 1
             self._worker.start()
             self._input_worker.start()
-            self.say(f"Ctrl+Alt+F4 ready; physical key/click acknowledgement ready; "
+            self.say(f"Ctrl+Alt+F4, ` and . ready; physical key/click acknowledgement ready; "
                      f"talking to {self.api}")
             # A thread timer (no window) posts WM_TIMER to this message loop.
             timer = self.user32.SetTimer(None, 0, POWER_CHECK_MS, None)

@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark"><title>__SYSTEM_NAME__</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect x='5' y='8' width='7' height='26' rx='2.5' fill='%235ad1e6'/%3E%3Crect x='3' y='31' width='11' height='5' rx='2' fill='%235ad1e6'/%3E%3Crect x='12' y='11' width='25' height='7' rx='2.5' fill='%23e9eef3'/%3E%3Crect x='17' y='11' width='4' height='7' fill='%23ff5b57'/%3E%3Crect x='25' y='11' width='4' height='7' fill='%23ff5b57'/%3E%3C/svg%3E">
+  <style data-c500-asset="theme.css">__THEME_CSS__</style>
+  <style data-c500-asset="zones.css">__ZONES_CSS__</style>
+</head>
+<body data-runtime="production">
+<svg class="sprite" aria-hidden="true" focusable="false">
+ <symbol id="i-live" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="13" rx="2.5"/><path d="m10 9 5 2.5-5 2.5z"/><path d="M8 21h8"/></symbol>
+ <symbol id="i-events" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></symbol>
+ <symbol id="i-vehicles" viewBox="0 0 24 24"><path d="M5 16v-4l2-5h10l2 5v4"/><path d="M3 16h18v3H3z"/><circle cx="7.5" cy="13" r=".6"/><circle cx="16.5" cy="13" r=".6"/></symbol>
+ <symbol id="i-setup" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></symbol>
+ <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M5.5 18.5l1.7-1.7M16.8 7.2l1.7-1.7"/></symbol>
+ <symbol id="i-health" viewBox="0 0 24 24"><path d="M3 12h4l2-5 4 10 2-5h6"/></symbol>
+ <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v8"/><path d="M6.4 6.6a8 8 0 1 0 11.2 0"/></symbol>
+ <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></symbol>
+ <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z"/></symbol>
+ <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.5 3 8.2 7 10 4-1.8 7-5.5 7-10V6z"/><path d="m9 12 2 2 4-4"/></symbol>
+ <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4M12 17h.01"/></symbol>
+ <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+ <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+ <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+ <symbol id="i-camera" viewBox="0 0 24 24"><rect x="3" y="7" width="13" height="10" rx="2"/><path d="m16 11 5-3v8l-5-3"/></symbol>
+ <symbol id="i-sound" viewBox="0 0 24 24"><path d="M4 10v4h4l5 4V6L8 10z"/><path d="M16.5 9a4 4 0 0 1 0 6M19 6.5a7.5 7.5 0 0 1 0 11"/></symbol>
+ <symbol id="i-enter" viewBox="0 0 24 24"><path d="M4 12h12M11 7l5 5-5 5"/><path d="M20 4v16"/></symbol>
+ <symbol id="i-exit" viewBox="0 0 24 24"><path d="M20 12H8M13 7l-5 5 5 5"/><path d="M4 4v16"/></symbol>
+ <symbol id="i-walk" viewBox="0 0 24 24"><circle cx="13" cy="4.5" r="1.8"/><path d="m9.5 21 2.5-7 3 3v5M8 12l2.5-4.5 4 1.5 2 3.5"/></symbol>
+ <symbol id="i-zones" viewBox="0 0 24 24"><path d="m5 6 13-2 2 13-14 3z"/></symbol>
+ <symbol id="i-system" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/></symbol>
+ <symbol id="i-expand" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
+ <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 4 9 5-9 5-9-5z"/><path d="m3 14 9 5 9-5"/></symbol>
+ <symbol id="i-barrier" viewBox="0 0 24 24"><path d="M5 20V6M3 20h5"/><path d="M5 9h15v3H5z"/></symbol>
+ <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/></symbol>
+ <symbol id="i-bell-off" viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 9.5-4.9M18 11v5l1.5 2H8"/><path d="M10 20a2 2 0 0 0 4 0"/><path d="M4 4l16 16"/></symbol>
+ <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="6" width="14" height="12" rx="2"/><path d="m17 10 4-2v8l-4-2"/></symbol>
+</svg>
+
+<div class="app" id="app">
+ <nav class="rail" aria-label="Main">
+  <a class="brand" href="#live" aria-label="__SYSTEM_NAME__ live view"><span class="brand-logo" aria-hidden="true"><i></i><b></b></span></a>
+  <div class="rail-group">
+   <button class="rail-item" data-page="live" aria-label="Live"><svg><use href="#i-live"/></svg><span>Live</span></button>
+   <button class="rail-item" data-page="events" aria-label="Events"><svg><use href="#i-events"/></svg><span>Events</span></button>
+   <button class="rail-item" data-page="vehicles" aria-label="Vehicles"><svg><use href="#i-vehicles"/></svg><span>Vehicles</span></button>
+  </div>
+  <div class="rail-group rail-secondary">
+   <button class="rail-item" data-page="setup" aria-label="Setup"><svg><use href="#i-setup"/></svg><span>Setup</span></button>
+   <button class="rail-item" data-page="settings" aria-label="Settings"><svg><use href="#i-settings"/></svg><span>Settings</span></button>
+   <button class="rail-item" data-page="health" aria-label="Health"><svg><use href="#i-health"/></svg><span>Health</span></button>
+  </div>
+  <button class="rail-item rail-power" id="power-off" aria-label="Full OFF" title="Full OFF: stop the whole program"><svg><use href="#i-power"/></svg><span>Full OFF</span></button>
+ </nav>
+
+ <header class="topbar">
+  <div class="title-block"><strong class="app-name">__SYSTEM_NAME__</strong><span class="app-place">Campus gate</span></div>
+  <div id="global-state" class="state-pill" role="status" aria-live="polite"><span class="status-dot"></span><span>Connecting</span></div>
+  <div class="topbar-actions">
+   <button id="pause-alerts" class="btn btn-quiet" type="button"><svg><use href="#i-pause"/></svg><span>Pause alerts</span></button>
+   <div class="clock" aria-label="Current time"><strong id="clock">--:--:--</strong><span id="date"></span></div>
+  </div>
+ </header>
+
+ <main class="pages">
+  <!-- LIVE -->
+  <section id="page-live" class="page page-live" aria-label="Live view">
+   <div class="live-main">
+    <article class="card camera-card">
+     <div id="camera-stage" class="camera-stage">
+      <!-- The keyboard's black margins are trimmed: picture and outlines move together inside this frame. -->
+      <div class="camera-frame">
+       <img id="feed" alt="Live camera view of the barrier gate">
+       <svg id="route-overlay" class="overlay" viewBox="0 0 640 360" preserveAspectRatio="xMidYMid meet" aria-hidden="true"></svg>
+       <svg id="barrier-overlay" class="overlay" viewBox="0 0 640 360" preserveAspectRatio="xMidYMid meet" aria-hidden="true"></svg>
+       <svg id="object-overlay" class="overlay objects" viewBox="0 0 640 360" preserveAspectRatio="xMidYMid meet" aria-hidden="true"></svg>
+      </div>
+      <div class="camera-chips">
+       <span class="glass camera-title"><svg><use href="#i-camera"/></svg><strong id="camera-view-name">Camera</strong><span id="camera-badge" class="badge">LIVE</span></span>
+       <span class="glass camera-tools">
+        <button id="toggle-zones" class="icon-btn selected" aria-pressed="true" title="Show or hide zone outlines"><svg><use href="#i-layers"/></svg><span>Zones</span></button>
+        <button id="fullscreen" class="icon-btn" title="Full screen camera"><svg><use href="#i-expand"/></svg><span class="sr-only">Full screen</span></button>
+       </span>
+      </div>
+      <div id="camera-empty" class="camera-empty"><svg><use href="#i-camera"/></svg><strong id="empty-title">Connecting camera</strong><span id="empty-subtitle">Waiting for a fresh picture</span></div>
+     </div>
+     <div id="camera-warning" class="camera-warning" hidden><svg><use href="#i-alert"/></svg><span></span><button class="link-btn" data-go="setup" data-setup="camera">Open camera setup</button></div>
+     <footer class="camera-foot">
+      <div class="legend"><span><i style="--c:var(--entry)"></i>Entrance</span><span><i style="--c:var(--exit)"></i>Exit</span><span><i style="--c:var(--path)"></i>Footpath</span></div>
+      <div class="camera-meta"><span id="frame-health">No frame</span><span class="sep"></span><span id="alignment-mini">Checking</span><button class="btn btn-sm" data-go="setup" data-setup="barriers"><svg><use href="#i-barrier"/></svg><span>Barriers &amp; empty road</span></button></div>
+     </footer>
+    </article>
+    <div id="route-cards" class="lanes" aria-label="Routes"></div>
+   </div>
+
+   <aside class="live-side" aria-label="Status">
+    <section id="attention-card" class="hero" aria-live="polite">
+     <div class="hero-top"><span class="hero-icon"><svg id="signal-icon"><use href="#i-shield"/></svg></span><span id="attention-kicker" class="hero-kicker">STATUS</span></div>
+     <p id="attention-overline" class="hero-overline">BARRIER GATE</p>
+     <h1 id="attention-title" class="hero-title">Connecting</h1>
+     <p id="attention-detail" class="hero-detail">Waiting for the watcher.</p>
+     <p id="alarm-audio-meta" class="hero-audio" hidden></p>
+     <div id="quiet-track" class="quiet" hidden><div class="quiet-label"><span>Quiet after acknowledgement</span><strong id="quiet-seconds">0.0s</strong></div><div class="quiet-bar"><i id="quiet-fill"></i></div></div>
+     <button id="acknowledge" class="btn btn-ack" type="button" disabled><svg><use href="#i-check"/></svg><span>Acknowledge</span></button>
+     <button id="hero-resume" class="btn btn-primary" type="button" hidden><svg><use href="#i-play"/></svg><span>Resume alerts</span></button>
+     <p id="ack-hint" class="hero-hint">No active alarm</p>
+    </section>
+
+    <section class="card health-strip" aria-label="Health">
+     <button class="health-chip" data-go="health"><i id="dot-camera"></i><span>Camera</span></button>
+     <button class="health-chip" data-go="health"><i id="dot-ai"></i><span>AI</span></button>
+     <button class="health-chip" data-go="health"><i id="dot-input"></i><span>Keys</span></button>
+     <button class="health-chip" data-go="health"><i id="dot-sound"></i><span>Sound</span></button>
+    </section>
+
+    <section class="card recent">
+     <header class="card-head"><h2>Recent events</h2><button class="link-btn" data-go="events">View all<svg><use href="#i-chevron"/></svg></button></header>
+     <div id="recent-events" class="recent-list"><div class="empty-row">Loading events</div></div>
+    </section>
+   </aside>
+  </section>
+
+  <!-- EVENTS -->
+  <section id="page-events" class="page page-events" aria-labelledby="events-title" hidden>
+   <header class="page-head"><div><h1 id="events-title">Events</h1><p id="event-count" class="page-sub">Loading</p></div>
+    <div class="seg" role="group" aria-label="Filter events by route">
+     <button class="selected" data-filter="all">All</button><button data-filter="entrance">Entrance</button><button data-filter="exit">Exit</button><button data-filter="pedestrian">Footpath</button><button data-filter="system">System</button>
+    </div>
+   </header>
+   <div id="activity-list" class="event-list"><div class="empty-row">Loading events</div></div>
+  </section>
+
+  <!-- VEHICLES -->
+  <section id="page-vehicles" class="page page-embedded" aria-label="Vehicle history" hidden>
+   <div id="vehicle-status" class="notice pending" role="status" aria-live="polite"><span class="status-dot"></span><strong id="vehicle-status-title">Checking vehicle history</strong><span id="vehicle-status-detail">Saved observations; possible return visits need review.</span></div>
+   <iframe id="cars-frame" title="Vehicle history" data-src="/car-memory"></iframe>
+  </section>
+
+  <!-- SETUP -->
+  <section id="page-setup" class="page page-setup" aria-labelledby="setup-title" hidden>
+   <header class="page-head"><div><h1 id="setup-title">Setup</h1><p class="page-sub">Camera framing, alarm zones and barrier positions. Use when the camera or site changes.</p></div>
+    <div class="seg seg-lg" role="tablist" aria-label="Setup sections">
+     <button role="tab" data-setup-tab="camera" class="selected" aria-selected="true"><svg><use href="#i-camera"/></svg>Camera framing</button>
+     <button role="tab" data-setup-tab="zones" aria-selected="false"><svg><use href="#i-zones"/></svg>Alarm zones</button>
+     <button role="tab" data-setup-tab="barriers" aria-selected="false"><svg><use href="#i-barrier"/></svg>Barriers &amp; empty road</button>
+    </div>
+   </header>
+
+   <section id="setup-camera" class="setup-panel" role="tabpanel" aria-label="Camera setup">
+    <div class="setup-grid">
+     <div class="card setup-preview">
+      <header class="card-head"><h2><span class="step">1</span>Check the framing</h2>
+       <div class="seg seg-sm" aria-label="Camera setup picture"><button id="setup-preview-aligned" class="selected" aria-pressed="true" type="button">Aligned</button><button id="setup-preview-raw" aria-pressed="false" type="button">Original</button></div></header>
+      <div class="setup-stage"><img id="setup-feed" alt="Current camera view for framing setup" hidden><svg id="setup-overlay" viewBox="0 0 640 360" preserveAspectRatio="xMidYMid meet" aria-hidden="true" hidden></svg><p id="setup-preview-empty">Waiting for a fresh camera picture</p></div>
+      <p id="setup-preview-caption" class="caption">Current camera preview unavailable</p>
+      <div id="framing-coach" class="framing-coach" role="status" aria-live="polite" hidden></div>
+     </div>
+     <div class="setup-side">
+      <div id="setup-state-card" class="card setup-state waiting">
+       <div class="setup-state-head"><span id="setup-state-mark" class="setup-state-mark waiting" aria-hidden="true">…</span><div><h2 id="setup-state-title">Waiting for setup readings</h2><p id="setup-reference">Reference status unavailable</p></div><div class="score"><strong id="setup-score">—</strong><span>checks</span></div></div>
+       <p id="setup-ready-copy" class="muted">Waiting for current measurements.</p>
+       <label class="meter-label" for="setup-stability"><span>View stability</span><span id="setup-stability-label">0.0 / 5 steady seconds</span></label>
+       <progress id="setup-stability" value="0" max="5">0 of 5 steady seconds</progress>
+       <div class="setup-measures"><span id="setup-coverage">Coverage unavailable</span><span id="setup-landmarks">Landmarks unavailable</span><span id="setup-current-view">View unconfirmed</span></div>
+       <ul id="setup-blockers" class="blockers" hidden></ul>
+       <p class="muted small">Measured setup checks, not detection accuracy.</p>
+      </div>
+      <fieldset class="card checklist"><legend><span class="step">2</span>Confirm what you see</legend>
+       <label class="check"><input id="setup-check-view" type="checkbox" disabled><span><strong>Camera view</strong><small>The name and picture match the view to monitor</small></span></label>
+       <label class="check"><input id="setup-check-exit" type="checkbox" disabled><span><strong>Exit road</strong><small>Lower-left arrival, full approach and exit barrier</small></span></label>
+       <label class="check"><input id="setup-check-entrance" type="checkbox" disabled><span><strong>Entrance road</strong><small>Top arrival, curved approach and entrance barrier</small></span></label>
+       <label class="check"><input id="setup-check-pedestrian" type="checkbox" disabled><span><strong>Footpath &amp; crossing</strong><small>Cabin path and road crossing</small></span></label>
+      </fieldset>
+      <div class="card finish">
+       <div><h2><span class="step">3</span>Finish</h2><p id="setup-review-state" class="muted">Review once for this view.</p></div>
+       <button id="setup-finish" class="btn btn-primary" type="button" disabled>Finish setup</button>
+      </div>
+      <details class="card advanced"><summary>Save a new camera reference</summary>
+       <p class="muted">Only after moving the camera. It replaces the alignment reference; it does not move the camera or change barrier positions.</p>
+       <button id="setup-pause" class="btn" type="button" disabled>Pause alerts for a new reference</button>
+       <label class="check"><input id="setup-empty-confirm" type="checkbox" disabled><span>Both lanes are clear and I want to replace the saved reference</span></label>
+       <div class="row"><button id="setup-capture" class="btn" type="button" disabled>Capture new reference</button><p id="setup-capture-note" class="muted">Pause alerts and complete the checks first.</p></div>
+      </details>
+      <p id="setup-action-status" class="setup-action-status status-line" role="status" aria-live="polite"></p>
+     </div>
+    </div>
+   </section>
+
+   <section id="setup-zones" class="setup-panel" role="tabpanel" aria-label="Zone editor" hidden>
+    <div id="zone-workspace"></div>
+   </section>
+
+   <section id="setup-barriers" class="setup-panel" role="tabpanel" aria-label="Barrier setup" hidden>
+    <p id="barrier-description" class="muted lead">Save each arm UP and DOWN with its lane empty. Capture saves a camera example; it does not move the barrier. Once both are saved, this lane’s arm reaching UP or DOWN during its alarm acknowledges that lane; the other lane’s arm does not.</p>
+    <div class="barrier-grid">
+     <div class="card barrier-picture-card">
+      <div class="barrier-picture"><img id="barrier-capture-image" alt="Current camera picture for barrier calibration" hidden><svg id="barrier-capture-overlay" class="overlay" viewBox="0 0 640 360" preserveAspectRatio="xMidYMid meet" aria-hidden="true"></svg><div id="barrier-picture-empty" class="picture-empty">Waiting for a fresh camera picture</div><span id="barrier-picture-state" class="badge">PICTURE UNAVAILABLE</span></div>
+      <p id="barrier-capture-status" class="caption">A fresh aligned camera picture is required.</p>
+     </div>
+     <div class="barrier-cards">
+      <section class="card barrier-card" aria-labelledby="barrier-exit-title" style="--lane:var(--exit)">
+       <header class="barrier-head"><h2 id="barrier-exit-title">Exit barrier</h2><span id="barrier-exit-state" class="arm-pill unknown">UNKNOWN</span></header>
+       <p id="barrier-exit-reason" class="muted small">Save UP and DOWN views</p>
+       <div class="inspection"><canvas id="barrier-exit-inspection" width="320" height="180" aria-label="Exit barrier inspection crop" hidden></canvas><span id="barrier-exit-inspection-label">Inspection unavailable</span></div>
+       <div class="captures">
+        <div class="capture"><span>UP</span><em id="barrier-exit-up-sample">Not saved</em><button id="capture-exit-up" class="btn btn-sm" data-barrier-action="capture" data-barrier="exit" data-barrier-position="up" aria-label="Capture exit barrier UP view" disabled>Capture UP</button></div>
+        <div class="capture"><span>DOWN</span><em id="barrier-exit-down-sample">Not saved</em><button id="capture-exit-down" class="btn btn-sm" data-barrier-action="capture" data-barrier="exit" data-barrier-position="down" aria-label="Capture exit barrier DOWN view" disabled>Capture DOWN</button></div>
+       </div>
+       <button id="reset-exit" class="link-btn danger" data-barrier-action="reset" data-barrier="exit" disabled>Reset exit examples</button>
+      </section>
+      <section class="card barrier-card" aria-labelledby="barrier-entrance-title" style="--lane:var(--entry)">
+       <header class="barrier-head"><h2 id="barrier-entrance-title">Entrance barrier</h2><span id="barrier-entrance-state" class="arm-pill unknown">UNKNOWN</span></header>
+       <p id="barrier-entrance-reason" class="muted small">Save UP and DOWN views</p>
+       <div class="inspection"><canvas id="barrier-entrance-inspection" width="320" height="180" aria-label="Entrance barrier inspection crop" hidden></canvas><span id="barrier-entrance-inspection-label">Inspection unavailable</span></div>
+       <div class="captures">
+        <div class="capture"><span>UP</span><em id="barrier-entrance-up-sample">Not saved</em><button id="capture-entrance-up" class="btn btn-sm" data-barrier-action="capture" data-barrier="entrance" data-barrier-position="up" aria-label="Capture entrance barrier UP view" disabled>Capture UP</button></div>
+        <div class="capture"><span>DOWN</span><em id="barrier-entrance-down-sample">Not saved</em><button id="capture-entrance-down" class="btn btn-sm" data-barrier-action="capture" data-barrier="entrance" data-barrier-position="down" aria-label="Capture entrance barrier DOWN view" disabled>Capture DOWN</button></div>
+       </div>
+       <button id="reset-entrance" class="link-btn danger" data-barrier-action="reset" data-barrier="entrance" disabled>Reset entrance examples</button>
+      </section>
+      <section class="card road-card">
+       <div><h2>Empty road</h2><p class="muted small">Lets a visit close by itself once the car has gone. Save with both lanes clear and both arms down.</p></div>
+       <button id="capture-road" class="btn" data-barrier-action="capture-road" aria-label="Save the empty road view" disabled>Save empty road</button>
+      </section>
+      <p id="barrier-feedback" class="status-line" role="status" aria-live="polite"></p>
+     </div>
+    </div>
+   </section>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="page-settings" class="page page-embedded" aria-label="Settings" hidden>
+   <iframe id="settings-frame" title="Settings" data-src="/settings?embedded=1"></iframe>
+  </section>
+
+  <!-- HEALTH -->
+  <section id="page-health" class="page page-health" aria-labelledby="health-title" hidden>
+   <header class="page-head"><div><h1 id="health-title">Health</h1><p class="page-sub">Live checks of the camera, AI, alignment, controls and sound.</p></div><span id="system-state" class="state-pill">Checking</span></header>
+   <div id="system-grid" class="tiles"></div>
+   <div class="health-bottom">
+    <section class="card chart-card"><header class="card-head"><h2>Processing time</h2><span class="muted small">Local pipeline, ms per frame</span></header>
+     <svg id="performance-chart" class="chart" viewBox="0 0 700 180" preserveAspectRatio="none" aria-label="Processing time chart"></svg>
+     <div class="chart-foot"><span id="chart-range">Waiting for readings</span><span id="chart-latest">—</span></div></section>
+    <section class="card sound-card"><header class="card-head"><h2>Sound</h2><span id="speaker-state" class="chip">Speaker checking</span></header>
+     <p class="muted small">Plays through the alarm speaker. The entrance rises, the exit falls.</p>
+     <div class="sound-actions">
+      <button id="test-alarm" class="btn" type="button"><svg><use href="#i-sound"/></svg><span>Test alarm</span></button>
+      <button id="hear-entrance" class="btn" type="button" data-lane-sound="entrance" disabled><span class="lane-dot" style="--c:var(--entry)"></span><span>Entrance tone</span></button>
+      <button id="hear-exit" class="btn" type="button" data-lane-sound="exit" disabled><span class="lane-dot" style="--c:var(--exit)"></span><span>Exit tone</span></button>
+     </div></section>
+    <section class="card program-card"><header class="card-head"><h2>Program</h2></header>
+     <dl class="facts"><div><dt>Connection</dt><dd><code>127.0.0.1:8787</code> · on this PC</dd></div><div><dt>Running for</dt><dd id="uptime">—</dd></div><div><dt>Camera source</dt><dd id="source-name">—</dd></div></dl>
+     <button id="power-off-health" class="btn btn-danger-soft" type="button"><svg><use href="#i-power"/></svg><span>Full OFF</span></button></section>
+   </div>
+  </section>
+ </main>
+</div>
+
+<dialog id="event-dialog" class="dialog event-dialog" aria-labelledby="event-dialog-title">
+ <div class="event-media"><video id="event-dialog-video" controls preload="metadata" playsinline hidden></video><img id="event-dialog-image" alt="Recorded camera image for the selected event"><p class="video-note" id="event-video-note" hidden></p></div>
+ <div class="event-body">
+  <header class="event-head"><span id="event-dialog-time" class="muted small"></span><button class="icon-btn" id="close-event" aria-label="Close event"><svg><use href="#i-close"/></svg></button></header>
+  <span class="eyebrow" id="event-dialog-source"></span>
+  <h2 id="event-dialog-title"></h2>
+  <p id="event-dialog-ack" class="muted"></p>
+  <p id="event-dialog-cross" class="note" hidden></p>
+  <div class="feedback" id="event-feedback" hidden>
+   <span id="event-feedback-question">Was this alarm right?</span>
+   <div class="row"><button type="button" class="btn btn-sm verdict real" data-verdict="real" aria-pressed="false">Real</button><button type="button" class="btn btn-sm verdict wrong" data-verdict="wrong" aria-pressed="false">Wrong alarm</button></div>
+   <p class="muted small" id="event-feedback-note"></p>
+  </div>
+  <details class="detail"><summary>Technical detail</summary><p id="event-dialog-detail"></p></details>
+ </div>
+</dialog>
+
+<dialog id="power-dialog" class="dialog power-dialog" aria-labelledby="power-title">
+ <span class="power-icon"><svg><use href="#i-power"/></svg></span>
+ <h2 id="power-title">Turn the whole program off?</h2>
+ <p>Stops the watcher, camera capture, AI and the key helper. No alarms sound until you open the __SYSTEM_NAME__ app again. To silence alarms for a moment, use Pause alerts instead.</p>
+ <div class="row end"><button class="btn" id="cancel-power">Cancel</button><button class="btn btn-danger" id="confirm-power">Turn fully off</button></div>
+</dialog>
+
+<div id="toast" class="toast" role="status" hidden></div>
+<script type="module" data-c500-bundle>__SCRIPT__</script>
+</body>
+</html>

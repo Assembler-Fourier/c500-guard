@@ -52,6 +52,7 @@ from approach_light import measure_local_brightness, measure_urgent_change
 from alarm_audio import plan as gentle_audio_plan, ensure_sounds as ensure_gentle_sounds, limited_plan, level_ceiling, lane_profile
 from visit_memory import VisitMemory
 from pipeline_health import PipelineHealth
+from pose_persistence import PoseWriter
 from barrier_workflow import BarrierWorkflow
 
 HERE = Path(__file__).resolve().parent
@@ -412,10 +413,23 @@ class Zone:
     taillight_red_pct: float = 2.0
     taillight_change_pct: float = 10.0
     taillight_wake_pct: float = 5.0
+    # trigger "headlights" (entrance lane beyond the barrier): new near-white light facing the camera.
+    headlight_pct: float = 3.0
+    headlight_max_pct: float = 60.0
+    headlight_white: float = 245.0
+    headlight_learn_s: float = 300.0
     # A vehicle cut off by the bottom of the picture still counts as inside this lane.
     bottom_edge_entry: bool = False
+    # PTZ2 clipped detections can stop short of the last picture row.
+    bottom_edge_y: float = .985
     # Weaker detections count only for a vehicle seen moving in (None = off).
     ai_confidence_moving: float | None = None
+    # Optional observed entry origin for weak, not-yet-confirmed visits.
+    # Normal-confidence vehicles and already-confirmed visits keep their rules.
+    ai_moving_entry_polygon: list | None = None
+    # Vehicles that have been in these route groups are leaving (unless moving toward_direction).
+    ignore_from_routes: list | None = None
+    toward_direction: list | None = None
 
     # runtime
     motion_active: bool = field(default=False, repr=False)
@@ -564,6 +578,8 @@ def ensure_sounds(force: bool = False) -> dict[str, Path]:
 class Buzzer:
     """Loops a tone until told to stop. Silent whenever the system is disarmed."""
 
+    PLAYBACK_RETRY_S = .5
+
     def __init__(self, sounds: dict[str, Path], muted: bool = False):
         self.sounds = sounds
         self.muted = muted
@@ -572,19 +588,52 @@ class Buzzer:
         self._profile: str | None = "soft"
         self._playing: Path | None = None
         self._lock = threading.Lock()
+        self._playback_error = ""
+        self._next_playback_retry = 0.0
+
+    def _start_locked(self, target: Path, *, replace: bool = False) -> None:
+        """Only report playing after the native player accepted the request.
+
+        Existing audio-policy ticks retry a failed request; no extra thread or
+        alarm is created, and an ACK/quiet profile prevents a later retry.
+        """
+        if (not replace and target == self._playing) or time.monotonic() < self._next_playback_retry:
+            return
+        try:
+            self.player.start_loop(target)
+        except Exception as error:                          # noqa: BLE001 - device failure must not stop detection
+            # The native player's replacement operation may already have
+            # stopped the previous sound before rejecting the new one.
+            self._playing = None
+            self._playback_error = f"Playback failed ({type(error).__name__}); retrying"
+            self._next_playback_retry = time.monotonic() + self.PLAYBACK_RETRY_S
+            return
+        self._playing = target
+        self._playback_error = ""
+        self._next_playback_retry = 0.0
+
+    def _stop_locked(self) -> None:
+        self.player.stop()
+        self._playing = None
+        self._playback_error = ""
+        self._next_playback_retry = 0.0
+
+    def playback_status(self) -> dict:
+        with self._lock:
+            return {"requested": self._want, "playing": self._playing is not None,
+                    "profile": self._profile, "error": self._playback_error,
+                    "retry_in_s": round(max(0., self._next_playback_retry - time.monotonic()), 2)}
 
     def set(self, kind: str | None) -> None:
         with self._lock:
-            if kind == self._want:
-                return
+            changed = kind != self._want
             self._want = kind
             if kind is None or self.muted or self._profile == "silent":
-                self.player.stop()
-                self._playing = None
+                if changed or self._playing is not None or self._playback_error:
+                    self._stop_locked()
             else:
                 selected = "fault" if kind == "fault" else (self._profile or "soft")
-                self._playing = self.sounds.get(selected, self.sounds[kind])
-                self.player.start_loop(self._playing)
+                self._start_locked(self.sounds.get(selected, self.sounds[kind]))
 
     def set_profile(self, profile: str) -> None:
         """Change the sound without creating another logical alarm."""
@@ -593,31 +642,27 @@ class Buzzer:
             if self._want is None or self.muted:
                 return
             if profile == "silent":
-                if self._playing is not None:
-                    self.player.stop()
-                    self._playing = None
+                if self._playing is not None or self._playback_error:
+                    self._stop_locked()
                 return
             target = self.sounds.get(profile, self.sounds[self._want])
-            if target != self._playing:
-                self._playing = target
-                self.player.start_loop(target)
+            self._start_locked(target)
 
     def replace_sounds(self, sounds: dict[str, Path]) -> None:
         """New sound style: a playing alarm switches to it straight away."""
         with self._lock:
             self.sounds = sounds
-            if self._want is None or self._playing is None or self.muted:
+            if self._want is None or self.muted or self._profile == "silent":
                 return
             selected = "fault" if self._want == "fault" else (self._profile or "soft")
-            self._playing = self.sounds.get(selected, self.sounds.get(self._want))
-            if self._playing is not None:
-                self.player.start_loop(self._playing)
+            target = self.sounds.get(selected, self.sounds.get(self._want))
+            if target is not None:
+                self._start_locked(target, replace=True)
 
     def shutdown(self) -> None:
         with self._lock:
             self._want = None
-            self._playing = None
-            self.player.stop()
+            self._stop_locked()
 
 
 class AlarmLoudness:
@@ -651,6 +696,7 @@ class AlarmLoudness:
         self.kind: str | None = None
         self.urgent = False
         self.gentle = False
+        self.pedestrian_latched = False
         self.started = 0.0
         self.applied: float | None = None
         self.plan = None
@@ -671,11 +717,14 @@ class AlarmLoudness:
         self.detail = "idle"
 
     def begin(self, kind: str, *, urgent: bool = False, gentle: bool = False,
-              source: str = "unknown", confirmed: bool = False, lane: str = "") -> None:
+              source: str = "unknown", confirmed: bool = False, lane: str = "",
+              pedestrian_latched: bool = False) -> None:
         with self._lock:
             if not self.enabled:
                 return
             self.kind = kind
+            self.pedestrian_latched = bool(pedestrian_latched and confirmed and source == "ai"
+                                           and kind in ("main", "early"))
             self.lane = lane if kind in ('main', 'early') and lane in ('entrance', 'exit') else ''
             self.urgent = bool(urgent)
             # Compatibility flags never bypass the fresh-evidence audio plan.
@@ -720,11 +769,11 @@ class AlarmLoudness:
             self._advance_progress(now)
             active = bool(fresh and present)
             previously_active = bool(self.evidence_fresh and self.event_present)
-            if not active:
+            if not active and not self.pedestrian_latched:
                 # An actual loss of evidence starts a new acoustic episode on
                 # return. No head-pose or confidence fluctuation takes this path.
                 self._reset_episode(None)
-            elif not previously_active:
+            elif active and not previously_active and not self.pedestrian_latched:
                 self._reset_episode(now)
             elif self.confirmed and not confirmed:
                 self._confirmation_hold_until = now + self.CONFIRMATION_HOLD_S
@@ -765,9 +814,9 @@ class AlarmLoudness:
         previous = self._progress_at
         self._progress_at = now
         if (previous is None or not self._mixer_ready or self._episode_at is None
-                or not self.evidence_fresh or not self.event_present):
+                or (not self.pedestrian_latched and (not self.evidence_fresh or not self.event_present))):
             return
-        through = now if self.confirmed else min(now, self._confirmation_hold_until)
+        through = now if self.confirmed or self.pedestrian_latched else min(now, self._confirmation_hold_until)
         self._confirmed_progress_s += max(0.0, through - previous)
 
     def _remembered(self) -> dict | None:
@@ -853,7 +902,7 @@ class AlarmLoudness:
             presence_state = self._episode_presence
             effective_confirmed = self._effective_confirmation(now)
             episode_age = max(0.0, now - self._episode_at) if self._episode_at is not None else 0.0
-            acoustic_age = self._confirmed_progress_s if effective_confirmed else episode_age
+            acoustic_age = self._confirmed_progress_s if effective_confirmed or self.pedestrian_latched else episode_age
             if not self._mixer_ready:
                 # Reacquiring mixer control must begin softly even if the
                 # incident has been visible for minutes during a device fault,
@@ -863,7 +912,8 @@ class AlarmLoudness:
                     presence_state=presence_state, evidence_fresh=self.evidence_fresh,
                     event_present=self.event_present,
                     confirmed=effective_confirmed and self.saved is not None,
-                    urgent=self.urgent and self.saved is not None)
+                    urgent=self.urgent and self.saved is not None,
+                    pedestrian_latched=self.pedestrian_latched and self.saved is not None)
             floor = self._confirmation_floor
             if (plan.audible and effective_confirmed and self._mixer_ready
                     and self.saved is not None and floor is not None):
@@ -907,7 +957,7 @@ class AlarmLoudness:
                 self.plan = fallback
                 self._select_profile(fallback.profile)
                 return
-            ceiling = level_ceiling(kind=self.kind, confirmed=effective_confirmed,
+            ceiling = level_ceiling(kind=self.kind, confirmed=effective_confirmed or self.pedestrian_latched,
                                     urgent=self.urgent)
             if abs(target-ceiling) < 1e-9:
                 # A fractional fake/real tick can land just below a milestone.
@@ -949,6 +999,7 @@ class AlarmLoudness:
         with self._lock:
             self._select_profile("silent")
             self.kind = None
+            self.pedestrian_latched = False
             self.lane = ""
             self.urgent = False
             self.gentle = False
@@ -1020,6 +1071,9 @@ class Watcher:
         self.zones = load_zones(Path(args.zones))
         # The chosen sound style decides which tones are written to disk.
         self.alarm_audio_settings = self._load_audio_settings(args.zones)
+        # The barrier left-up beep repeats with its sound file: write it with the configured interval.
+        import alarm_audio as _reminder_audio
+        _reminder_audio.set_reminder_period(self._load_barrier_rules(args.zones)['reminder_every_s'])
         self.sounds = ensure_sounds()
         self.buzzer = Buzzer(self.sounds, muted=args.silent)
         self.reader = FrameReader(args.source, args.fps, args.connect_grace, args.lost_after)
@@ -1032,6 +1086,7 @@ class Watcher:
         self.started = time.monotonic()
         self.pipeline = PipelineHealth()
         self.warmup_started: float | None = None
+        self._semantic_warmup_started: float | None = None
         # Seeded with the start time so a source that never connects at all
         # still raises FEED LOST instead of sitting silently at OK.
         self.last_frame_at = self.started
@@ -1050,6 +1105,7 @@ class Watcher:
         self._state_lock = threading.RLock()
         self.armed = self._load_armed()
         self._pending_rearm = False
+        self._pending_background_reset = False
         self._pending_zones = None
         self.alarm: str | None = None        # None | "early" | "main" | "fault"
         self.alarm_reason = ""
@@ -1149,6 +1205,8 @@ class Watcher:
         self._alignment_good = None
         self._alignment_used = None
         self._alignment_pose = None
+        self._pose_writer = PoseWriter()
+        self._pose_requested = None
         self.alignment_hold_s = 10.0
         # Learned lighting references share the zone coordinate frame of the
         # main reference; index 0 is the main reference, i is extra i-1.
@@ -1210,7 +1268,7 @@ class Watcher:
         self._arm_live, self._arm_last_run, self._arm_motion_acked = {}, 0., set()
         from vehicle_sightings import VehicleSightings
         self.sightings = VehicleSightings(STATE_DIR / "vehicle-sightings",
-                                          enabled=self._load_sightings_enabled(args.zones))
+                                          enabled=self._load_sightings_enabled(args.zones), async_writes=True)
         if self.semantic is not None:
             self.semantic.keep_frames = self.sightings.enabled
         self._settings_lock = threading.Lock()
@@ -1359,6 +1417,7 @@ class Watcher:
 
     def _switch_view(self, profile: Path, name: str) -> None:
         """Save the active zones back to their own profile, make the matching view active, restart."""
+        self._invalidate_pose_writes()
         from zone_editor import _atomic_write
         active = Path(self.args.zones)
         current = getattr(self, 'view_name', None)
@@ -1415,18 +1474,36 @@ class Watcher:
             return None
 
     def _maybe_save_pose(self, matrix, shape) -> None:
-        """Persist a verified pose only when it really changes, so writes stay rare."""
+        """Queue verified poses; disk flushes must never stall detection or ACK."""
         from scene_alignment import pose_gap_px
-        if self._alignment_pose is not None and pose_gap_px(matrix, self._alignment_pose, shape) <= 0.5:
+        writer = getattr(self, '_pose_writer', None)
+        if writer is None:
             return
-        self._alignment_pose = np.asarray(matrix, dtype=np.float64)
-        try:
-            from zone_editor import _atomic_write
-            _atomic_write(self._pose_path(), json.dumps({
-                "current_to_reference": self._alignment_pose.round(6).tolist(),
-                "saved": time.strftime("%Y-%m-%dT%H:%M:%S")}).encode())
-        except OSError:
-            pass
+        path = self._pose_path()
+        saved = writer.saved()
+        if saved is not None and saved['path'] == path:
+            self._alignment_pose = np.asarray(saved['current_to_reference'], dtype=np.float64)
+        state = writer.status()
+        requested = getattr(self, '_pose_requested', None)
+        busy = state['pending'] or state['writing']
+        if self._alignment_pose is not None and pose_gap_px(matrix, self._alignment_pose, shape) <= 0.5:
+            # A pose that returns to its saved position must also supersede a
+            # different pending write; otherwise a transient excursion wins.
+            if not (busy and requested is not None and requested[0] == path
+                    and pose_gap_px(matrix, requested[1], shape) > .5):
+                return
+        if (busy and requested is not None
+                and requested[0] == path and pose_gap_px(matrix, requested[1], shape) <= .5):
+            return
+        snapshot = np.asarray(matrix, dtype=np.float64).copy()
+        if writer.submit(path, snapshot.round(6).tolist(), time.strftime('%Y-%m-%dT%H:%M:%S')):
+            self._pose_requested = (path, snapshot)
+
+    def _invalidate_pose_writes(self):
+        writer = getattr(self, '_pose_writer', None)
+        if writer is not None and not writer.invalidate():
+            raise OSError('Previous pose publication is still finishing; retry the camera-reference change')
+        self._pose_requested = None
 
     # -- recovering after the camera is physically moved --------------------
     def _reacquire_path(self):
@@ -1497,6 +1574,11 @@ class Watcher:
                 self._reacquire_info = {**report, "reason": "The re-mapped view failed the usual checks"}
                 continue
             moved = screen_registration.movement_px(matrix, reference.shape[:2])
+            try:
+                self._invalidate_pose_writes()
+            except OSError as error:
+                self._reacquire_info = {**report, 'reason': str(error)}
+                return  # Keep old coordinates until publication is fenced.
             self._reacquire = matrix
             self._reacquire_info = {**report, "moved_px": round(moved, 1), "reference_index": index,
                                     "at": time.strftime("%H:%M:%S"), "reason": ""}
@@ -1688,18 +1770,33 @@ class Watcher:
                                        for index, aligner in enumerate(self._extra_aligners)})
         _atomic_write(self._extra_path(), buffer.getvalue())
 
+    # At night the preferred reference usually confirms the verified position only weakly (landmarks concentrated).
+    # Probing another reference on every such frame doubled the alignment cost (21 Nov 2026); once a second finds a
+    # stronger reference just as surely. A rejected preferred reference still probes on every frame.
+    WEAK_PROBE_INTERVAL_S = 1.0
+
     def _update_alignment(self, frame, prior):
         """Try the preferred reference, then one other in turn; a strong match wins."""
         aligners = [self.aligner] + self._extra_aligners
         preferred = self._preferred_aligner if self._preferred_aligner < len(aligners) else 0
         order = [preferred]
         if len(aligners) > 1:
-            self._probe_index = (self._probe_index + 1) % len(aligners)
-            if self._probe_index == preferred:
-                self._probe_index = (self._probe_index + 1) % len(aligners)
-            order.append(self._probe_index)
+            next_probe = (self._probe_index + 1) % len(aligners)
+            if next_probe == preferred:
+                next_probe = (next_probe + 1) % len(aligners)
+            order.append(next_probe)
         first = weak = None
         for index in order:
+            if index != order[0] and weak is not None:
+                now = time.monotonic()
+                if now - getattr(self, '_weak_probe_at', -math.inf) < self.WEAK_PROBE_INTERVAL_S:
+                    break
+                self._weak_probe_at = now
+            if index != preferred:
+                # Advance only for an actual probe. Advancing on skipped
+                # frames aliases with a regular camera cadence and can leave
+                # some lighting references untested indefinitely.
+                self._probe_index = index
             aligned, info = aligners[index].update(frame, prior=prior)
             if first is None:
                 first = (aligned, info)
@@ -1840,6 +1937,53 @@ class Watcher:
             self._calibration_error = ""
             self.alignment = {**self.alignment, "state": "calibrating", "message": "Saving the current scene reference"}
 
+    def request_guided_calibration(self, reference_id):
+        """Reject stale setup reviews; ordinary zone-editor calibration stays explicit."""
+        with self._state_lock:
+            setup = self._camera_setup_status()
+            if not setup or not setup.get('ready_to_save'):
+                raise ValueError('Wait for all camera setup checks before capturing a reference')
+            if not isinstance(reference_id, str) or reference_id != setup.get('reference_id'):
+                raise ValueError('The camera position or zones changed; review the routes again')
+            self.request_calibration()
+
+    def _camera_setup_calibration(self):
+        return {'pending': bool(getattr(self, '_pending_calibration', False)),
+                'error': getattr(self, '_calibration_error', ''),
+                'revision': getattr(self, '_setup_calibration_revision', 0)}
+
+    def _camera_setup_status(self):
+        assessment = getattr(self, '_camera_setup', None)
+        if assessment is None:
+            return None
+        now = time.monotonic()
+        return assessment.status(now, frame_age=now-getattr(self, 'last_frame_at', 0.),
+                                 calibration=self._camera_setup_calibration())
+
+    def _update_camera_setup(self, frame, now):
+        """Read-only geometry/progress; no calibration, alarm or tracking decision."""
+        from camera_setup import CameraSetupAssessment
+        import hashlib
+        if not hasattr(self, '_camera_setup'):
+            self._camera_setup = CameraSetupAssessment()
+        reference = getattr(self, '_alignment_reference', None)
+        cached = getattr(self, '_setup_reference', None)
+        if cached is None or cached[0] is not reference:
+            digest = hashlib.sha256(reference.tobytes()).hexdigest()[:16] if reference is not None else 'none'
+            self._setup_reference = (reference, digest)
+        matrix = self.alignment.get('current_to_reference')
+        if matrix is not None:
+            matrix = np.asarray(matrix, dtype=np.float64)
+            if matrix.shape == (2, 3):
+                matrix = np.vstack((matrix, [0., 0., 1.]))
+            if self._reacquire is not None:
+                matrix = matrix @ np.asarray(self._reacquire, dtype=np.float64)
+        zones = [{'name': z.name, 'polygon': z.polygon or rect_polygon(z.rect)} for z in self.zones]
+        self._camera_setup.update(matrix=matrix, shape=frame.shape, zones=zones,
+            alignment=self.alignment, stamp=now, view=self._view_title(),
+            reference_id=self._setup_reference[1], reference_saved=reference is not None,
+            calibration=self._camera_setup_calibration())
+
     def request_lighting_reference(self):
         """Keep the current view (at the verified pose) as an extra lighting reference."""
         with self._state_lock:
@@ -1857,8 +2001,42 @@ class Watcher:
             self._lighting_status = "Checking the current view as a lighting reference"
 
     def align_frame(self, frame):
+        requested = time.perf_counter()
         with self._state_lock:
-            return self._align_frame_locked(frame)
+            acquired = time.perf_counter()
+            self._alignment_steps = {}
+            try:
+                return self._align_frame_locked(frame)
+            finally:
+                finished = time.perf_counter()
+                # The pipeline stage also includes waiting for this lock.
+                # Separate that wait from actual alignment/reference work.
+                self.alignment.update(lock_wait_ms=round((acquired-requested)*1000, 3),
+                                      work_ms=round((finished-acquired)*1000, 3),
+                                      total_ms=round((finished-requested)*1000, 3))
+                self._alignment_step_name = None
+                if finished-requested >= 2.0:
+                    # Keep rare stalls after ordinary frames overwrite the
+                    # current timings. Publish a new bounded tuple atomically:
+                    # diagnostics can read it without the state/control lock.
+                    sample = {key: self.alignment[key] for key in
+                              ('lock_wait_ms', 'work_ms', 'total_ms')}
+                    sample.update(finished_at=time.monotonic(),
+                                  finished_wall=time.time(),
+                                  steps_ms=dict(self._alignment_steps))
+                    self._alignment_slow = (*getattr(self, '_alignment_slow', ()), sample)[-8:]
+
+    def _alignment_step(self, name, function, *args, **kwargs):
+        """Measure work only; no logging, I/O, worker or control changes."""
+        started = time.perf_counter()
+        self._alignment_step_name = name
+        try:
+            return function(*args, **kwargs)
+        finally:
+            steps = getattr(self, '_alignment_steps', None)
+            if steps is not None:
+                steps[name] = round(steps.get(name, 0.) + (time.perf_counter()-started)*1000, 3)
+            self._alignment_step_name = None
 
     @staticmethod
     def _keyboard_menu_visible(frame) -> bool:
@@ -1931,6 +2109,7 @@ class Watcher:
                 buffer = BytesIO()
                 np.savez_compressed(buffer, reference=reference)
                 from zone_editor import _atomic_write
+                self._invalidate_pose_writes()
                 _atomic_write(path, buffer.getvalue())
                 self.aligner = candidate
                 self._alignment_reference = reference.copy()
@@ -1947,10 +2126,12 @@ class Watcher:
                         stale.unlink(missing_ok=True)
                     except OSError:
                         pass
+                self._setup_calibration_revision = getattr(self, '_setup_calibration_revision', 0) + 1
                 self._pending_rearm = True
             except Exception as exc:
                 self._calibration_error = str(exc)
-        aligned, info = self._update_alignment(frame, self._alignment_prior())
+        aligned, info = self._alignment_step('reference_match', self._update_alignment,
+                                             frame, self._alignment_prior())
         if aligned is not None and not self._reacquired_zones_visible(camera_frame, info.get('current_to_reference')):
             aligned = None
             info = {**info, 'accepted': False, 'reason': 'An alert zone is outside the recovered camera view'}
@@ -1962,12 +2143,15 @@ class Watcher:
             if matrix is not None and not info.get("weak"):
                 from scene_alignment import pose_gap_px
                 if self._alignment_used is not None and pose_gap_px(matrix, self._alignment_used[0], frame.shape) > 2.0:
-                    # The zones would visibly jump: relearn the background first.
-                    self._alignment_rearm_reason = "Verified camera correction exceeded two pixels"
-                    self._pending_rearm = True
+                    # The accepted transform still maps into the SAME canonical
+                    # zone coordinates. Pixel differences need a new background,
+                    # but current AI tracks/results are in that canonical space
+                    # too. Restarting them here made repeated small corrections
+                    # create repeated blind warmups and lose served identities.
+                    self._pending_background_reset = True
                 self._last_strong_at = now
                 self._alignment_good = (matrix, now)
-                self._maybe_save_pose(matrix, frame.shape)
+                self._alignment_step('pose_persistence', self._maybe_save_pose, matrix, frame.shape)
             if matrix is not None:
                 self._alignment_used = (matrix, now)
             if self._alignment_blocked:
@@ -1982,7 +2166,7 @@ class Watcher:
             # rejection lasting longer than the hold becomes a fault.
             if (self._alignment_used is not None and not self._alignment_blocked
                     and (now - self._alignment_bad_since <= self.alignment_hold_s
-                         or self._structure_still_matches(frame, now))):
+                         or self._alignment_step('structure_match', self._structure_still_matches, frame, now))):
                 try:
                     aligned = (self.aligner.warp(frame, self._alignment_used[0])
                                if self._reacquired_zones_visible(camera_frame, self._alignment_used[0]) else None)
@@ -1993,9 +2177,9 @@ class Watcher:
         if self._alignment_blocked:
             # A physically moved camera is found here, so the status published
             # below already reflects this attempt.
-            self._try_reacquire(camera_frame, now)
-            self._try_other_views(camera_frame, now)
-            self._try_bootstrap(frame, now)
+            self._alignment_step('reacquire', self._try_reacquire, camera_frame, now)
+            self._alignment_step('other_views', self._try_other_views, camera_frame, now)
+            self._alignment_step('bootstrap', self._try_bootstrap, frame, now)
         translation = info.get("translation_px") or [0, 0]
         if holding:
             translation = [self.alignment.get("dx", 0), self.alignment.get("dy", 0)]
@@ -2025,14 +2209,23 @@ class Watcher:
             framing_info = {**info, "current_to_reference": self._alignment_used[0], "framing_retained": True}
         elif accepted and info.get("weak"):
             framing_info = {**info, "framing_retained": True}
-        framing = self._framing_status(accepted or holding, framing_info, now, frame.shape)
+        framing = self._alignment_step('framing', self._framing_status,
+                                       accepted or holding, framing_info, now, frame.shape)
         if framing is not None:
             self.alignment["framing"] = framing
             self.alignment["view"] = self._view_title()
             if framing.get("state") != "ok":
                 self.alignment["message"] = f"{self.alignment['message']} \u00b7 {framing['text']}"
-        self._note_alignment_transition(now)
-        self._consider_learning(frame, aligned if accepted else None, info, now)
+        try:
+            self._alignment_step('setup_assessment', self._update_camera_setup, frame, now)
+        except Exception:
+            # Setup advice cannot interrupt the primary detection loop. A failed
+            # assessment must not leave an old ready/successful setup visible.
+            from camera_setup import CameraSetupAssessment
+            self._camera_setup = CameraSetupAssessment()
+        self._alignment_step('transition_note', self._note_alignment_transition, now)
+        self._alignment_step('lighting_learning', self._consider_learning,
+                             frame, aligned if accepted else None, info, now)
         if self._pending_lighting:
             # A steady but moved camera must not certify its own stale pose.
             self._pending_lighting = False
@@ -2067,6 +2260,11 @@ class Watcher:
         except Exception:
             pass  # Recording failures never interrupt the alert path.
 
+    # Low light (21 Nov 2026): strong <-> weak-but-confirmed tracking flipped ~33 times a minute and filled the
+    # recording store with one diagnostic video a minute. Weak accepted tracking keeps the zones at the verified
+    # position, so those flips are logged at most once a minute and never record a video.
+    WEAK_FLIP_LOG_S = 60.
+
     def _note_alignment_transition(self, now):
         """Record brief losses too: they may recover before the fault sound threshold."""
         try:
@@ -2074,16 +2272,28 @@ class Watcher:
             key = (state.get('state'), bool(state.get('weak')), self._alignment_blocked,
                    getattr(self, 'view_name', None))
             previous = getattr(self, '_alignment_note', None)
-            if previous and previous[0] != key and (key[0] != 'tracking' or key[1]):
+            if previous and previous[0] != key and (key[0] != 'tracking' or key[2]):
                 self._record_diagnostic_clip('alignment', state.get('message', 'Alignment uncertain'), now)
             if previous and (previous[0] == key or now-previous[1] < 1.):
                 return
+            low_light_flip = bool(previous and previous[0][0] == key[0] == 'tracking' and not previous[0][2]
+                                  and not key[2] and previous[0][3] == key[3])
+            if low_light_flip and now - getattr(self, '_weak_flip_logged_at', -math.inf) < self.WEAK_FLIP_LOG_S:
+                self._alignment_note = (key, now)
+                self._weak_flips_unlogged = getattr(self, '_weak_flips_unlogged', 0) + 1
+                return
+            if low_light_flip:
+                self._weak_flip_logged_at = now
+            extra = {}
+            if getattr(self, '_weak_flips_unlogged', 0):
+                extra['unlogged_low_light_flips'] = self._weak_flips_unlogged
+            self._weak_flips_unlogged = 0
             self._alignment_note = (key, now)
             self.log_event('alignment-transition', state.get('message', ''),
                            previous=previous[0] if previous else None, current=key,
                            pending_reset=bool(self._pending_rearm),
                            matrix=state.get('current_to_reference'),
-                           inliers=state.get('inliers'), static_agreement=state.get('static_agreement'))
+                           inliers=state.get('inliers'), static_agreement=state.get('static_agreement'), **extra)
         except Exception:
             pass  # Diagnostics must never gate frame processing.
 
@@ -2192,6 +2402,14 @@ class Watcher:
             # Recheck after obtaining the state lock: time spent waiting for
             # alignment or another operation must not freshen old evidence.
             return False
+        if (self.alarm in ("main", "early") and not self.acked
+                and self.alarm_details.get("manual_ack_required") is True):
+            # This operator-attention incident cannot be retired or replaced
+            # by a vehicle/barrier event. Faults remain visible in health UI.
+            return False
+        pedestrian_latched = (kind in ("main", "early") and details.get("source") == "ai"
+                              and details.get("label") == "person"
+                              and details.get("route_role") == "pedestrian")
         decision = None
         if (kind != 'fault' and self.alarm in ('early','main') and self.alarm_id and not self.acked):
             decision = self.visits.continue_unanswered(self.alarm_details.get('visit_id'),self.alarm_id,
@@ -2225,6 +2443,7 @@ class Watcher:
                                  (previous_evidence.get("fresh") is True
                                   and previous_evidence.get("present") is False))
         if (self.alarm and not self.acked and not previous_resolved
+                and not pedestrian_latched
                 and rank[kind] <= rank.get(self.alarm, 0)):
             return False
         if self.alarm in ("early", "main", "fault") and self.alarm_id and not self.acked:
@@ -2238,6 +2457,10 @@ class Watcher:
         self.alarm = kind
         self.alarm_reason = reason
         self.alarm_details = dict(details or {})
+        # A caller cannot latch an unconfirmed light/movement observation.
+        self.alarm_details.pop("manual_ack_required", None)
+        if pedestrian_latched:
+            self.alarm_details["manual_ack_required"] = True
         if decision and decision.visit_id:
             self.alarm_details["visit_id"] = decision.visit_id
         self.alarm_since = now
@@ -2261,7 +2484,8 @@ class Watcher:
         self.loudness.begin(kind, source=details.get("source", "unknown"),
                             confirmed=details.get("source") == "ai",
                             lane=details.get("route_role", ""),
-                            urgent=(bool(details.get("strict_change")) or learned) and not let_in)
+                            urgent=(bool(details.get("strict_change")) or learned) and not let_in,
+                            **({"pedestrian_latched": True} if pedestrian_latched else {}))
         self.buzzer.set(kind)
         snapshot = self._queue_snapshot(kind)
         self.log_event(kind, reason, alarm_id=self.alarm_id, snapshot=snapshot,
@@ -2288,6 +2512,8 @@ class Watcher:
             # Dismissing the "arm left up" knock: quiet until that arm closes.
             workflow = getattr(self, 'barrier_workflow', None)
             muted = workflow.mute_reminders() if workflow is not None else []
+            # Quiet until each arm now up has closed (its confirmed up-period ends).
+            self._left_up_muted = {arm: row['since'] for arm, row in self._left_up_arms().items()}
             self.buzzer.set(None)
             self.loudness.end()
             self.log_event("reminder-muted", f"via {via}: barrier left up", routes=muted)
@@ -2394,7 +2620,7 @@ class Watcher:
                           and not self._alignment_blocked
                           and workflow is not None
                           and self.barrier_rules.get('reminder', True)
-                          and workflow.status().get('reminder_active') is True)
+                          and (self._left_up_due() or workflow.status().get('reminder_active') is True))
                 if active:
                     if self.loudness.kind != 'barrier_open':
                         self._reminder_seq = getattr(self, '_reminder_seq', 0) + 1
@@ -2437,7 +2663,7 @@ class Watcher:
             primary = self.semantic.status() if self.semantic else {}
             trusted = (not self._alignment_blocked and self.alignment.get('state') == 'tracking'
                        and self._local_frame_fresh(stamp)
-                       and time.monotonic()-self.warmup_started >= self.args.warmup)
+                       and self._semantic_warmup_remaining() <= 0.)
             armed = self.armed
         try:
             with self._pipeline_measure('barriers', source_at=stamp):
@@ -2447,7 +2673,8 @@ class Watcher:
             current = workflow.status()
             # Cross-check service decisions against this frame's angle reading,
             # rather than the previous frame (which may show the opposite pose).
-            self._observe_arm_angles(frame, stamp, trusted, current)
+            self._observe_arm_angles(frame, stamp,
+                                     trusted and current.get('trusted') is True, current)
             for intent in intents:
                 if intent.get('type') == 'resolve':
                     self._resolve_service_visit(intent)
@@ -2578,6 +2805,8 @@ class Watcher:
 
     def _alarm_lane(self):
         """Only a vehicle lane can be served by a physical barrier."""
+        if self.alarm_details.get("manual_ack_required") is True:
+            return None
         role = self.alarm_details.get('route_role')
         if role:
             return role if role in ('exit', 'entrance') else None
@@ -2614,6 +2843,37 @@ class Watcher:
             seen[1] = now
             lanes[role] = seen
         return metrics
+
+    def _measure_headlights(self, zone, frame, shape) -> dict:
+        """The headlight bloom inside the zone's bounding box; the lane's usual-white map is kept on the zone."""
+        from exit_entry import measure_headlights
+        try:
+            now = time.monotonic()
+            last = getattr(zone, '_headlight_at', None)
+            ys, xs = zone.slice_for(shape[1], shape[0])
+            metrics, usual = measure_headlights(
+                np.asarray(frame)[ys, xs], getattr(zone, '_headlight_usual', None),
+                zone.mask_for(shape[1], shape[0])[ys, xs], white=float(zone.headlight_white),
+                pct=float(zone.headlight_pct), max_pct=float(zone.headlight_max_pct),
+                learn_s=float(zone.headlight_learn_s), dt=(now - last) if last is not None else .1)
+            zone._headlight_usual, zone._headlight_at = usual, now
+            bounds = metrics.get("support_bounds")
+            if bounds:
+                metrics["support_bounds"] = (bounds[0] + (xs.start or 0), bounds[1] + (ys.start or 0),
+                                             bounds[2], bounds[3])
+            # A validated entrance bloom warrants the same fast AI look as an
+            # exit-corner arrival. This changes cadence, never confirmation,
+            # visit identity or whether a barrier can acknowledge the alarm.
+            semantic = getattr(self, 'semantic', None)
+            if metrics.get("hit") and semantic is not None and hasattr(semantic, "boost"):
+                try:
+                    semantic.boost(self.AI_BOOST_S)
+                except Exception:                          # noqa: BLE001 - AI failure cannot hide a light warning
+                    pass
+            return metrics
+        except Exception:                                   # noqa: BLE001 - one bad frame never stops detection
+            zone._headlight_usual = None
+            return {"bright_pct": 0.0, "hit": False}
 
     def _note_arm_rise(self, arm, reading) -> None:
         """Remember when each arm last began to rise (monotonic frame time)."""
@@ -3044,7 +3304,7 @@ class Watcher:
     def _load_barrier_rules(zones_path) -> dict:
         rules = {'ack_on_raise': True, 'ack_on_lower': True, 'ack_any_arm': True, 'ack_on_movement': True,
                  'reminder': True,
-                 'reminder_after_s': 15., 'reminder_every_s': 15.}
+                 'reminder_after_s': 60., 'reminder_every_s': 10.}
         try:
             block = json.loads(Path(zones_path).read_text(encoding="utf-8-sig")).get("barriers") or {}
         except (OSError, ValueError, AttributeError, TypeError):
@@ -3055,7 +3315,7 @@ class Watcher:
         for key in ('reminder_after_s', 'reminder_every_s'):
             value = block.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-                rules[key] = min(600., max(15., float(value)))
+                rules[key] = min(600., max(10. if key == 'reminder_every_s' else 15., float(value)))
         return rules
 
     def _apply_barrier_rules(self) -> None:
@@ -3149,10 +3409,36 @@ class Watcher:
             _atomic_write(path.with_name(f'{path.name}.settings-{stamp}-{os.getpid()}'), path.read_bytes())
             _atomic_write(path, (json.dumps(updated, indent=1, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
             self._apply_live_settings(updated, changed)
+            shared = {key: changes[key] for key in changed if key in self.SHARED_VIEW_SETTINGS}
+            if shared:
+                self._share_view_settings(path, shared)
             if 'system.name' in changed:
                 self.display_name = self._load_display_name(path)
         self.log_event('settings', ', '.join(f'{key}={changes[key]}' for key in changed)[:400])
         return {"ok": True, "changed": changed}
+
+    SHARED_VIEW_SETTINGS = ('barriers.reminder', 'barriers.reminder_after_s', 'barriers.reminder_every_s')
+
+    def _share_view_settings(self, active: Path, changes: dict) -> None:
+        """The barrier-up reminder is one switch for the desk: copy it into each saved camera view as well, so a
+        view change (which loads that view's own file) keeps what the operator chose. Nothing else is copied."""
+        import settings_store
+        from zone_editor import read_config, validate_config, _atomic_write
+        folder = active.resolve().parent / "views"
+        for profile in sorted(folder.glob("*/zones.json")) if folder.is_dir() else []:
+            try:
+                original = read_config(profile)
+                updated, _changed = settings_store.apply_changes(original, changes)
+                if updated != original:
+                    updated = validate_config(updated, updated)
+                    raw = profile.read_bytes().decode("utf-8-sig")      # keep the file's own layout
+                    spaces = re.search(r'\n( +)"', raw)
+                    newline = "\r\n" if "\r\n" in raw else "\n"
+                    text = json.dumps(updated, indent=len(spaces.group(1)) if spaces else 1, ensure_ascii=False,
+                                      allow_nan=False)
+                    _atomic_write(profile, (text.replace("\n", newline) + newline).encode("utf-8"))
+            except Exception as exc:                        # noqa: BLE001 - the active view is already saved
+                self.log_event('settings', f'reminder setting not copied to view {profile.parent.name}: {exc}'[:300])
 
     def _apply_live_settings(self, config: dict, changed: list) -> None:
         import alarm_audio
@@ -3172,6 +3458,13 @@ class Watcher:
         if any(key.startswith('barriers.') for key in changed):
             self.barrier_rules = self._load_barrier_rules(args_zones)
             self._apply_barrier_rules()
+            period = alarm_audio.reminder_period()
+            if alarm_audio.set_reminder_period(self.barrier_rules['reminder_every_s']) != period:
+                sounds = ensure_sounds(force=True)          # the beep repeats with its file
+                replace = getattr(self.buzzer, 'replace_sounds', None)
+                if replace is not None:
+                    replace(sounds)
+                self.sounds = sounds
         if any(key in changed for key in ('ai.interval_s', 'ai.whole_picture')) and self.semantic is not None:
             self.semantic.interval = self._load_ai_interval(args_zones)
             self.semantic.context_view = self._load_ai_whole_picture(args_zones)
@@ -3207,19 +3500,24 @@ class Watcher:
         if workflow is None:
             return {'configured': False, 'barriers': [], 'error': getattr(self, '_barrier_error', '')}
         status = {**workflow.status(), 'error': self._barrier_error, **self._arm_memory_status()}
+        try:                                                # display only: the Live timer and bell
+            rules = self.barrier_rules
+            status['left_up'] = {arm: {'up_s': round(row['up_s'], 1), 'muted': row['muted']}
+                                 for arm, row in self._left_up_arms().items()}
+            status['reminder'] = {'enabled': bool(rules.get('reminder', True)),
+                                  'after_s': rules.get('reminder_after_s'), 'every_s': rules.get('reminder_every_s'),
+                                  'sounding': not self.alarm and self.loudness.kind == 'barrier_open'}
+        except Exception:                                   # noqa: BLE001 - never costs the barrier reading
+            pass
+        from arm_angle import display_barrier_row
+        geometry = getattr(getattr(self, '_arm_tracker', None), 'geometry', {}) or {}
         live, rows = getattr(self, '_arm_live', None) or {}, []
         for row in status.get('barriers', []):
             reading = live.get(row.get('id')) if isinstance(row, dict) else None
             recent = reading and 0 <= time.time() - reading.get('at_wall', 0) < 1.5
-            if recent and reading.get('position_conflict') is True and row.get('state') in ('up', 'down'):
-                row = {**row, 'classifier_state': row['state'], 'state': 'unknown',
-                       'confidence': 0., 'active_line': None, 'candidate_position': None,
-                       'live_line': None, 'live_angle': None, 'live_motion': None,
-                       'reason': 'Arm angle disagrees with calibrated position'}
-            elif recent and reading.get('line'):
-                row = {**row, 'live_line': reading['line'], 'live_angle': reading.get('theta'),
-                       'live_motion': reading.get('motion')}
-            rows.append(row)
+            rows.append(display_barrier_row(
+                row, reading, geometry.get(row.get('id')),
+                reading_fresh=bool(recent), width=PROC_W, height=PROC_H))
         status['barriers'] = rows
         return status
 
@@ -3402,6 +3700,53 @@ class Watcher:
                                    arm=arm, state=state, previous_for_s=held)
         except Exception:                                   # noqa: BLE001 - display and history only
             pass
+
+    LEFT_UP_SEEN_S = 5.
+
+    def _left_up_arms(self, now=None) -> dict:
+        """Arms confirmed up (arm memory) and still seen up within LEFT_UP_SEEN_S: how long, and whether muted."""
+        now = time.monotonic() if now is None else now
+        muted = getattr(self, '_left_up_muted', None) or {}
+        rows = {}
+        for arm, item in dict(getattr(self, '_arm_memory', None) or {}).items():
+            try:
+                if item['state'] == 'up' and 0 <= now - item['seen'] <= self.LEFT_UP_SEEN_S:
+                    rows[arm] = {'up_s': max(0., now - item['since']), 'since': item['since'],
+                                 'muted': muted.get(arm) == item['since']}
+            except (KeyError, TypeError):
+                continue
+        return rows
+
+    def _left_up_due(self, now=None) -> bool:
+        """An arm has been up for the reminder delay and nobody has silenced it for this up-period."""
+        after = self.barrier_rules.get('reminder_after_s', 60.)
+        return any(row['up_s'] >= after and not row['muted'] for row in self._left_up_arms(now).values())
+
+    def _note_lane_seen(self, primary) -> None:
+        """Wall time an AI vehicle (road lanes) or person (footpath) was last seen in each route's zones."""
+        try:
+            seen = getattr(self, '_lane_seen', None)
+            if seen is None:
+                seen = self._lane_seen = {}
+            detections = (primary or {}).get('detections') or []
+            regions = set()
+            for item in detections:
+                if isinstance(item, dict):
+                    regions.update(name for name in item.get('regions', []) if isinstance(name, str))
+            if not regions:
+                return
+            now = time.time()
+            for zone in self.zones:
+                if zone.name in regions and zone.route_role in ('entrance', 'exit', 'pedestrian'):
+                    seen[zone.route_role] = now
+        except Exception:                                   # noqa: BLE001 - display only
+            pass
+
+    def _lane_seen_status(self) -> dict:
+        now = time.time()
+        return {role: {'last_seen_s': round(max(0., now - at), 1),
+                       'at': time.strftime('%H:%M:%S', time.localtime(at))}
+                for role, at in dict(getattr(self, '_lane_seen', None) or {}).items()}
 
     def _arm_memory_status(self) -> dict:
         now, rows = time.monotonic(), {}
@@ -3592,11 +3937,16 @@ class Watcher:
 
     def alerts(self) -> dict:
         with self._state_lock:
-            return {"version": self.alerts_version,
-                    "alerts": [{**alert, "acked": dict(alert["acked"]) if alert["acked"] else None,
-                                "feedback": dict(alert["feedback"]) if alert.get("feedback") else None,
-                                **self._recording_fields(alert.get("id"))}
-                               for alert in self.recent_alerts]}
+            report = {"version": self.alerts_version,
+                      "alerts": [{**alert, "acked": dict(alert["acked"]) if alert["acked"] else None,
+                                  "feedback": dict(alert["feedback"]) if alert.get("feedback") else None}
+                                 for alert in self.recent_alerts]}
+        # Recording lookup can touch storage or wait for the recorder worker.
+        # It must not hold the lock needed by the detector and acknowledgement.
+        # Version and mutable alert fields above belong to one consistent snapshot.
+        for alert in report["alerts"]:
+            alert.update(self._recording_fields(alert.get("id")))
+        return report
 
     def _recording_fields(self, alarm_id) -> dict:
         recorder = getattr(self, 'recorder', None)
@@ -3757,28 +4107,37 @@ class Watcher:
             self._resume_alarm_check = False
             rearm = self._pending_rearm
             self._pending_rearm = False
+            background_reset = self._pending_background_reset
+            self._pending_background_reset = False
             if self._pending_zones is not None:
                 self.zones = self._pending_zones
                 self._pending_zones = None
                 if self.semantic:
                     self.semantic.zones = self.zones
                 rearm = True
-        if rearm:
+        if rearm or background_reset:
             if getattr(self, '_approach_warnings', None) is not None:
                 self._approach_warnings.reset()
-            alignment_reason = getattr(self, '_alignment_rearm_reason', None)
+            alignment_reason = (getattr(self, '_alignment_rearm_reason', None) if rearm else
+                                'Verified camera correction exceeded two pixels')
             if alignment_reason:
                 self._alignment_rearm_reason = None
                 self.log_event('alignment-reset', alignment_reason,
-                               warmup_s=self.args.warmup, view=getattr(self, 'view_name', None))
-            if self.semantic:
-                self.semantic.reset()
+                               warmup_s=self.args.warmup, view=getattr(self, 'view_name', None),
+                               reset_scope='all' if rearm else 'background')
+            if rearm:
+                self._semantic_warmup_started = None
+                if self.semantic:
+                    self.semantic.reset()
+            elif self._semantic_warmup_started is None:
+                self._semantic_warmup_started = self.warmup_started
             # Consume the re-arm request here, on the detector thread only.
             self.bg = self.bg_noise = None
             self._light_credits.clear()
             for zone in self.zones:
                 zone.motion_active = zone.light_active = False
                 zone._change_previous = None
+                zone._headlight_usual = None
                 zone._counts = {k: 0 for k in zone._counts}
                 zone._notified = {"motion": False, "light": False}
         if not hasattr(self, "lighting_monitor"):
@@ -3794,11 +4153,16 @@ class Watcher:
             # Start cautious: assume a little flicker everywhere until measured.
             self.bg_noise = np.full_like(gray, INITIAL_NOISE)
             self.warmup_started = time.monotonic()
-            return True
+            if self._semantic_warmup_started is None:
+                self._semantic_warmup_started = self.warmup_started
+                return True
         diff = compensated_motion_diff(gray, self.bg)
         if not self._accept_local_frame(received_at):
             return False
         warm = (time.monotonic() - self.warmup_started) < self.args.warmup
+        semantic_start = (self._semantic_warmup_started if self._semantic_warmup_started is not None
+                          else self.warmup_started)
+        semantic_warm = (time.monotonic() - semantic_start) < self.args.warmup
         light_candidates, motion_candidates = [], []
         for zone in self.zones:
             ys, xs = zone.slice_for(gray.shape[1], gray.shape[0])
@@ -3829,9 +4193,18 @@ class Watcher:
             motion_hit = zone.trigger not in ("ai", "ai_light") and zone.motion and zone.last_pct >= zone.motion_pct
             if zone.trigger == "taillight":
                 # Exit entry corner: lit red tail lights moving in (white headlights of entering cars do not).
-                zone.light_metrics = self._measure_taillights(zone, frame, gray.shape)
+                zone.light_metrics = (self._measure_taillights(zone, frame, gray.shape) if zone.light else
+                                      {"hit": False, "disabled": True})
                 zone.last_delta = zone.light_metrics.get("red_pct", 0.0)
                 zone.last_pct = zone.light_metrics.get("changed_pct", 0.0)
+                light_hit, motion_hit = bool(zone.light_metrics.get("hit")), False
+                if light_hit and zone.light_metrics.get("support_bounds"):
+                    self._note_highlight(zone, zone.light_metrics["support_bounds"], gray.shape, "light")
+            if zone.trigger == "headlights":
+                # Entrance lane: an arriving car's headlights facing the camera (the AI can be blinded by them).
+                zone.light_metrics = (self._measure_headlights(zone, frame, gray.shape) if zone.light else
+                                      {"hit": False, "disabled": True})
+                zone.last_delta = zone.last_pct = zone.light_metrics.get("bright_pct", 0.0)
                 light_hit, motion_hit = bool(zone.light_metrics.get("hit")), False
                 if light_hit and zone.light_metrics.get("support_bounds"):
                     self._note_highlight(zone, zone.light_metrics["support_bounds"], gray.shape, "light")
@@ -3893,8 +4266,10 @@ class Watcher:
         if not self._accept_local_frame(received_at):
             return False
         self.visits.observe(now, self.zones, primary,
-                            frame_fresh=not warm and not self._alignment_blocked,
+                            frame_fresh=not semantic_warm and not self._alignment_blocked,
                             width=frame.shape[1], height=frame.shape[0])
+        if not semantic_warm and not self._alignment_blocked:
+            self._note_lane_seen(primary)
         # Fast corner warnings still precede inference, with the same soft onset.
         for zone in motion_candidates:
             if not self._accept_local_frame(received_at):
@@ -3924,41 +4299,16 @@ class Watcher:
             if self.raise_alarm(zone.severity, f"{zone.name}: vehicle-shaped movement towards the entrance; advance warning",
                                 details=details):
                 detector.mark_emitted(motion['observed_at'])
-        # Deliver the urgent road warning before any synchronous AI/tracker
-        # work, so its latency or exception cannot prevent that siren.
-        if not self._accept_local_frame(received_at):
-            return False
-        if self.semantic:
-            events = (self.semantic.update(frame, self.armed and not warm)
-                      if received_at is None else
-                      self.semantic.update(frame, self.armed and not warm, stamp=received_at))
-        else:
-            events = []
-        if not self._accept_local_frame(received_at):
-            return False
-        primary = self.semantic.status() if self.semantic else {}
-        self._feed_sightings(primary)
-        if not self._accept_local_frame(received_at):
-            return False
-        self._note_ai_activity(primary, time.monotonic())
-        self.visits.observe(time.monotonic(), self.zones, primary,
-                            frame_fresh=not warm and not self._alignment_blocked,
-                            width=frame.shape[1], height=frame.shape[0])
-        for kind, reason, event_id in events:
-            context = self.semantic.event_context(event_id)
-            if getattr(self, 'learning', None) is not None:
-                self.learning.note_recognised((context or {}).get('route_group'))
-            observed_at = (context or {}).get('observed_at', received_at)
-            if not self._local_frame_fresh(observed_at):
-                continue
-            evidence_stamp = {} if observed_at is None else {'frame_received_at': observed_at}
-            if self.raise_alarm(kind, reason, details={"source": "ai", **(context or {}), **evidence_stamp}):
-                self.semantic.mark_emitted(event_id)
+        # Independent validated light warnings must sound before AI consumption
+        # or optional vehicle evidence can delay or expire this frame.
         for zone in sorted(light_candidates, key=lambda item: not item.priority):
             if not self._accept_local_frame(received_at):
                 return False
             cause = "localized light change" if zone.trigger == "ai_light" else "brightness rose"
             text = f"{zone.name}: {cause} {zone.last_delta:+.1f}; approach warning"
+            if zone.trigger == "headlights":
+                text = (f"{zone.name}: headlights facing the entrance barrier "
+                        f"({zone.light_metrics.get('bright_pct', 0):.1f}% of the lane); a vehicle is arriving")
             if zone.trigger == "taillight":
                 text = (f"{zone.name}: vehicle tail lights entering the lane "
                         f"({zone.light_metrics.get('red_pct', 0):.1f}% red, "
@@ -3972,6 +4322,35 @@ class Watcher:
                              "alert_stage":zone.alert_stage,
                              "measurement":dict(zone.light_metrics),
                              **self._alarm_context(zone, primary, time.monotonic())})
+        # Deliver the urgent road warning before any synchronous AI/tracker
+        # work, so its latency or exception cannot prevent that siren.
+        if not self._accept_local_frame(received_at):
+            return False
+        if self.semantic:
+            events = (self.semantic.update(frame, self.armed and not semantic_warm)
+                      if received_at is None else
+                      self.semantic.update(frame, self.armed and not semantic_warm, stamp=received_at))
+        else:
+            events = []
+        if not self._accept_local_frame(received_at):
+            return False
+        primary = self.semantic.status() if self.semantic else {}
+        if not self._accept_local_frame(received_at):
+            return False
+        self._note_ai_activity(primary, time.monotonic())
+        self.visits.observe(time.monotonic(), self.zones, primary,
+                            frame_fresh=not semantic_warm and not self._alignment_blocked,
+                            width=frame.shape[1], height=frame.shape[0])
+        for kind, reason, event_id in events:
+            context = self.semantic.event_context(event_id)
+            if getattr(self, 'learning', None) is not None:
+                self.learning.note_recognised((context or {}).get('route_group'))
+            observed_at = (context or {}).get('observed_at', received_at)
+            if not self._local_frame_fresh(observed_at):
+                continue
+            evidence_stamp = {} if observed_at is None else {'frame_received_at': observed_at}
+            if self.raise_alarm(kind, reason, details={"source": "ai", **(context or {}), **evidence_stamp}):
+                self.semantic.mark_emitted(event_id)
         for zone in motion_candidates:
             if not self._accept_local_frame(received_at):
                 return False
@@ -3984,6 +4363,12 @@ class Watcher:
                          **self._alarm_context(zone, primary, time.monotonic())})
         self._observe_barrier_service(frame, received_at)
         self._update_alarm_audio()
+        if not self._accept_local_frame(received_at):
+            return False
+
+        # Vehicle photos/history are optional evidence. Deliver the current
+        # alarm and barrier service first; storage must not swallow that arrival.
+        self._feed_sightings(primary)
         if not self._accept_local_frame(received_at):
             return False
 
@@ -4153,15 +4538,23 @@ class Watcher:
 
     @staticmethod
     def _overlay_objects(observed) -> list:
-        """Objects the AI is following, ready to outline: normalised box, recent path, zone and state."""
+        """Main-view road objects and people; full candidates remain in AI diagnostics."""
         objects = []
-        for obj in list(observed or [])[:12]:
+        for obj in list(observed or [])[:50]:
             try:
                 box = obj.get('box_n')
                 if not isinstance(box, (list, tuple)) or len(box) != 4:
                     continue
                 confirmed = [str(name) for name in obj.get('confirmed_regions') or []]
                 regions = [str(name) for name in obj.get('regions') or []]
+                if (obj.get('label') in ('car', 'bus', 'truck', 'motorcycle')
+                        and isinstance(obj.get('regions'), list) and not regions and not confirmed):
+                    # Padded crops can hallucinate a vehicle on illuminated
+                    # road outside every monitored lane. Those unscoped model
+                    # guesses must not be presented as lane traffic. Keep them
+                    # in the tracker/Analyze data: their earlier path can still
+                    # establish direction when a real vehicle enters a zone.
+                    continue
                 zone = (confirmed or regions or [''])[0]
                 objects.append({
                     'id': obj.get('track_id'), 'label': str(obj.get('label', ''))[:20],
@@ -4171,9 +4564,52 @@ class Watcher:
                     'zone': zone, 'status': str((obj.get('region_status') or {}).get(zone, ''))[:40],
                     'trail': [[round(float(x), 4), round(float(y), 4)]
                               for x, y in list(obj.get('trail') or [])[-10:]]})
+                if len(objects) == 12:
+                    break
             except (TypeError, ValueError, AttributeError):
                 continue
         return objects
+
+    def _display_objects(self, report):
+        """Continue fresh measured boxes briefly across region borders, display only.
+
+        No predicted/last-seen boxes, alarm evidence or visit timing is created.
+        Unknown road guesses still cannot establish their own display history.
+        """
+        observed = report.get('detections', [])
+        stamp, age = report.get('observed_at'), report.get('age_s')
+        generation = report.get('tracking_generation')
+        valid = (not getattr(self, '_alignment_blocked', False)
+                 and isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+                 and math.isfinite(stamp) and isinstance(age, (int, float)) and 0 <= age < 1.)
+        if not valid:
+            self._display_routes = {}
+            return self._overlay_objects(observed) if age is not None and 0 <= age < 3 and not self._alignment_blocked else []
+        key = (str(generation), getattr(self, 'view_name', None))
+        if key != getattr(self, '_display_generation', None):
+            self._display_routes = {}
+            self._display_generation = key
+        memory = {ident: value for ident, value in getattr(self, '_display_routes', {}).items()
+                  if 0 <= stamp-value[0] <= 1.}
+        visible = []
+        for obj in observed[:50]:
+            ident = obj.get('track_id')
+            regions = obj.get('confirmed_regions') or obj.get('regions') or []
+            confidence = obj.get('confidence', 0.)
+            if (isinstance(ident, int) and not isinstance(ident, bool)
+                    and obj.get('label') in ('car','bus','truck','motorcycle')
+                    and isinstance(confidence, (int,float)) and confidence >= .5):
+                if regions:
+                    memory[ident] = (stamp, str(regions[0]))
+                elif ident in memory:
+                    box = self._overlay_objects([{**obj, 'regions':[memory[ident][1]]}])
+                    if box:
+                        box[0].update(state='seen', zone='', status='Crossing zone boundary')
+                        visible.extend(box)
+                        continue
+            visible.extend(self._overlay_objects([obj]))
+        self._display_routes = dict(list(memory.items())[-50:])
+        return visible[:12]
 
     def _draw_objects(self, draw, objects) -> None:
         for obj in objects:
@@ -4257,7 +4693,7 @@ class Watcher:
             if self.semantic:
                 info = self.semantic.status()
                 if info.get('age_s') is not None and info['age_s'] < 3:
-                    self._draw_objects(draw, self._overlay_objects(info.get('detections', [])))
+                    self._draw_objects(draw, self._display_objects(info))
         # Leave the original camera timestamp visible. A newly painted PC
         # clock must never make delayed source video appear current.
         framing = (getattr(self, "alignment", None) or {}).get("framing") or {}
@@ -4308,6 +4744,14 @@ class Watcher:
         with self._state_lock:
             return self._state_dict_locked()
 
+    def _semantic_warmup_remaining(self):
+        started = getattr(self, '_semantic_warmup_started', None)
+        if started is None:
+            started = self.warmup_started
+        if self._pending_rearm or started is None:
+            return float(self.args.warmup)
+        return max(0., self.args.warmup-(time.monotonic()-started))
+
     def _state_dict_locked(self) -> dict:
         ml = self.semantic.status() if self.semantic else {
             "available": False, "state": "unavailable", "error": "Local model not installed"}
@@ -4316,6 +4760,7 @@ class Watcher:
         return {
             "armed": self.armed,
             "barriers": self.barrier_status(),
+            "lanes": self._lane_seen_status(),
             "control_warning": self.control_warning,
             "alarm": self.alarm,
             "alarm_id": self.alarm_id,
@@ -4329,8 +4774,9 @@ class Watcher:
             "ack_remaining_s": round(max(0., self._ack_until-time.monotonic()), 2),
             "source": safe_source(self.args.source),
             "camera_view": self._view_title(),
+            "camera_setup": self._camera_setup_status(),
             "ml": ml,
-            "objects": self._overlay_objects(observed),
+            "objects": self._display_objects(ml),
             "change_boxes": self._change_boxes(),
             "ui_version": ui_version(getattr(self, "display_name", None)),
             "sightings": self.sightings.status() if getattr(self, "sightings", None) else None,
@@ -4351,6 +4797,8 @@ class Watcher:
             "processing_ms": round(self.processing_ms, 1),
             "dropped_frames": self.reader.dropped_frames,
             "warmup_remaining_s": round(max(0, self.args.warmup - (time.monotonic()-self.warmup_started)), 1) if self.armed and self.warmup_started else 0,
+            "semantic_warmup_remaining_s": self._semantic_warmup_remaining() if self.armed else 0.,
+            "background_warmup_remaining_s": round(max(0, self.args.warmup-(time.monotonic()-self.warmup_started)), 1) if self.armed and self.warmup_started else 0.,
             "sleep_prevention": {"active": self.sleep_inhibitor.active,
                                  "detail": self.sleep_inhibitor.detail},
             "last_frame_age": round(time.monotonic() - self.last_frame_at, 1),
@@ -4359,7 +4807,8 @@ class Watcher:
             # A coarse picture of the learned flicker, so the dashboard can
             # show which parts of the view the watcher deliberately ignores.
             "noise_grid": self._noise_grid(),
-            "audio": dict(self.audio),
+            "audio": {**dict(self.audio), "playback": (self.buzzer.playback_status()
+                      if hasattr(self.buzzer, 'playback_status') else {})},
             "input_helper": self._input_helper_status(),
             "alerts_version": self.alerts_version,
             "server_time": time.strftime("%H:%M:%S"),
@@ -4454,6 +4903,11 @@ class Watcher:
             "dropped_frames": getattr(reader, "dropped_frames", 0),
         }
         report["loop_heartbeat_age_s"] = round(max(0., now-getattr(self, "_loop_heartbeat", now)), 3)
+        report['alignment_step'] = getattr(self, '_alignment_step_name', None)
+        writer = getattr(self, '_pose_writer', None)
+        report['pose_persistence'] = writer.status() if writer is not None else None
+        report['alignment_slow'] = [{**item, 'steps_ms': dict(item['steps_ms'])}
+                                    for item in getattr(self, '_alignment_slow', ())]
         report["main_stack"] = []
         if report.get("stage_age_s", 0) >= 2.0 or report.get("measurement_slow"):
             frame = sys._current_frames().get(threading.main_thread().ident)
@@ -4513,6 +4967,7 @@ class Watcher:
     def run(self) -> None:
         if (STATE_DIR / 'power-off').exists():
             return
+        self._pose_writer.start()
         self._loop_heartbeat = time.monotonic()
         self.reader.start()
         self.presence.start()
@@ -4679,6 +5134,8 @@ class Watcher:
                    ("volume", self.loudness.end), ("buzzer", self.buzzer.shutdown),
                    ("desk camera", self.presence.stop), ("reader", self.reader.stop),
                    ("sleep prevention", self.sleep_inhibitor.__exit__)]
+        if getattr(self, '_pose_writer', None) is not None:
+            cleanup.insert(3, ('pose persistence', self._pose_writer.stop))
         if getattr(self, "_keys", None):
             cleanup.append(("terminal keys", self._keys.restore))
         if self.semantic:
@@ -4924,7 +5381,8 @@ def start_web(watcher: Watcher, port: int) -> None:
             host = self.headers.get('Host', '')
             if host.split(':')[0] not in ('127.0.0.1', 'localhost') or (origin and origin != 'http://' + host):
                 return self._send(403, 'text/plain', b'Local access only')
-            if self.headers.get('X-Via') not in ('web', 'ctl', 'hotkey', 'zones', 'zone-editor', 'input-any-key', 'input-mouse'):
+            if self.headers.get('X-Via') not in ('web', 'ctl', 'hotkey', 'hotkey-dot', 'zones', 'zone-editor',
+                                                 'input-any-key', 'input-mouse'):
                 return self._send(403, 'text/plain', b'Local control header required')
             if self.path == '/power/off':
                 if self.headers.get('X-Via') not in ('web', 'ctl'):
@@ -4947,7 +5405,16 @@ def start_web(watcher: Watcher, port: int) -> None:
                     return self._send(400, 'application/json', json.dumps({'error':str(exc)}).encode())
             if self.path == "/alignment/calibrate":
                 try:
-                    watcher.request_calibration()
+                    size = int(self.headers.get('Content-Length', '0'))
+                    if not 0 <= size <= 2048:
+                        raise ValueError('Invalid calibration request size')
+                    payload = json.loads(self.rfile.read(size)) if size else {}
+                    if not isinstance(payload, dict):
+                        raise ValueError('Invalid calibration request')
+                    if payload.get('guided') is True:
+                        watcher.request_guided_calibration(payload.get('reference_id'))
+                    else:
+                        watcher.request_calibration()
                     return self._send(200, 'application/json', b'{"ok":true,"pending":true}')
                 except PermissionError as exc:
                     return self._send(409, 'application/json', json.dumps({'error':str(exc)}).encode())

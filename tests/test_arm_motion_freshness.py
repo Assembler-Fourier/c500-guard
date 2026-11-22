@@ -83,6 +83,47 @@ class ArmMotionFreshnessTests(unittest.TestCase):
         tracker.reset.assert_called_once()
         self.assertEqual({}, self.obj._arm_live)
 
+    def test_calibration_busy_cannot_bypass_workflow_trust_via_angle_tracker(self):
+        now = time.monotonic()
+        self.obj.last_frame_at = now
+        self.obj._semantic_warmup_remaining = mock.Mock(return_value=0.)
+        self.obj._local_frame_fresh = mock.Mock(return_value=True)
+        self.obj.semantic = mock.Mock()
+        self.obj.semantic.status.return_value = {'state': 'ready'}
+        self.obj.barrier_workflow = mock.Mock()
+        self.obj.barrier_workflow.observe.return_value = []
+        self.obj.barrier_workflow.status.return_value = {
+            'trusted': False, 'busy': True, 'barriers': [], 'service': {'routes': {}}}
+        self.obj._arm_tracker = mock.Mock()
+        self.obj._arm_tracker.update.return_value = {'exit': self.reading()}
+        self.obj._arm_live = {'exit': self.reading()}
+        self.obj._arm_last_run = 0.
+        self.obj._ack_on_any_arm = mock.Mock()
+        self.obj._note_arm_memory = mock.Mock()
+        self.obj._observe_barrier_service(object(), now)
+        self.obj._arm_tracker.update.assert_not_called()
+        self.obj._arm_tracker.reset.assert_called_once()
+        self.assertEqual({}, self.obj._arm_live)
+        self.assertEqual('fresh-motion-test', self.obj.alarm_id)
+        self.obj._mark_alert_acknowledged.assert_not_called()
+
+    def test_verified_workflow_still_runs_current_angle_tracker(self):
+        now = time.monotonic()
+        self.obj._semantic_warmup_remaining = mock.Mock(return_value=0.)
+        self.obj._local_frame_fresh = mock.Mock(return_value=True)
+        self.obj.semantic = mock.Mock()
+        self.obj.barrier_workflow = mock.Mock()
+        self.obj.barrier_workflow.observe.return_value = []
+        self.obj.barrier_workflow.status.return_value = {'trusted': True, 'barriers': []}
+        self.obj._arm_tracker = mock.Mock()
+        self.obj._arm_tracker.update.return_value = {}
+        self.obj._arm_last_run = 0.
+        self.obj._ack_on_any_arm = mock.Mock()
+        self.obj._note_arm_memory = mock.Mock()
+        frame = object()
+        self.obj._observe_barrier_service(frame, now)
+        self.obj._arm_tracker.update.assert_called_once_with(frame, now)
+
 
 if __name__ == '__main__':
     unittest.main()

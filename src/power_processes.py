@@ -27,6 +27,7 @@ SCRIPT_COMPONENTS = (
     ("watch.py", "watcher"),
     ("lan_shim.py", "LAN relay"),
 )
+LAUNCHER = "app launcher"
 STOP_ORDER = tuple(component for _, component in SCRIPT_COMPONENTS) + (
     "native app", "car-memory updater", "camera bridge", "video decoder")
 
@@ -137,6 +138,11 @@ def cleanup_pid_files(state=STATE, repo=REPO):
             pass
 
 
+def without_launcher(snapshot):
+    """A failed start keeps the app's own window, so it can say why and offer Try again."""
+    return {**snapshot, "owned": [row for row in snapshot["owned"] if row.get("component") != LAUNCHER]}
+
+
 def stop_owned(*, inventory_fn=inventory, stop_fn=ps.stop_process_tree, sleep=time.sleep):
     """Exact identity is verified again, under a held handle, before every stop."""
     stopped, errors = [], []
@@ -167,13 +173,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("inventory", "stop"))
     parser.add_argument("--root", type=Path, default=REPO)
+    parser.add_argument("--keep-launcher", action="store_true",
+                        help="leave the app launcher running (failed start: it shows the reason)")
     args = parser.parse_args()
     if not ps.WINDOWS:
         print(json.dumps({"ok": False, "error": "Windows only"}))
         return 2
     try:
         identities = expected_identities(args.root.resolve(), STATE)
-        snapshot = lambda: inventory(identities=identities)
+        snapshot = ((lambda: without_launcher(inventory(identities=identities))) if args.keep_launcher
+                    else (lambda: inventory(identities=identities)))
         result = snapshot() if args.action == "inventory" else stop_owned(inventory_fn=snapshot)
         if args.action == "stop":
             cleanup_pid_files(repo=args.root.resolve())

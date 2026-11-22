@@ -15,6 +15,10 @@ from object_tracking import ObjectVisitTracker
 from regional_inference import add_context_detections, inference_rects, merge_view_detections, merge_corrob_view
 
 
+class _EntranceBudgetExceeded(RuntimeError):
+    """A completed, healthy optional inference took too long to use."""
+
+
 class SemanticMonitor:
     RETRY_INITIAL = 2.0
     RETRY_MAX = 60.0
@@ -22,6 +26,9 @@ class SemanticMonitor:
     MAX_DIAGNOSTIC_VIEWS = 4
     MAX_DIAGNOSTIC_DETECTIONS = 50
     WEAK_CANDIDATE_CONFIDENCE = .30
+    ENTRANCE_BUDGET_MS = 500.
+    ENTRANCE_RETRY_INITIAL = 5.
+    ENTRANCE_RETRY_MAX = 60.
 
     def __init__(self, zones, model_path: Path, interval=0.75, confidence=0.60, context_view=False,
                  entrance_verifier_path=None):
@@ -265,6 +272,8 @@ class SemanticMonitor:
         detector = None
         verifier = None
         verifier_status = {'state': 'disabled'}
+        verifier_retry_at = 0.
+        verifier_backoff = self.ENTRANCE_RETRY_INITIAL
         backoff = self.RETRY_INITIAL
         while not self._stop.is_set():
             if detector is None:
@@ -277,6 +286,8 @@ class SemanticMonitor:
                     if not detector.available:
                         raise RuntimeError(detector.status().get('error') or 'Local AI initialization failed')
                     verifier, verifier_status = self._make_entrance_verifier()
+                    verifier_retry_at = 0.
+                    verifier_backoff = self.ENTRANCE_RETRY_INITIAL
                     with self._result_lock:
                         # Do not process a frame retained throughout model loading/recovery.
                         self._clear_queue(self._input)
@@ -343,8 +354,20 @@ class SemanticMonitor:
                 if verifier is not None and extra_view is None:
                     verifier_status = {'state': 'unavailable',
                         'error': 'Entrance check requires the whole picture and an enabled entrance region'}
+                extra_now = time.monotonic()
+                if extra_view is not None and extra_now < verifier_retry_at:
+                    verifier_status = {'state': 'cooldown', '_retry_at': verifier_retry_at,
+                        'error': 'Entrance check exceeded its 500 ms processing budget; retrying after cooldown'}
+                elif (extra_view is not None
+                        and extra_now-stamp >= self.MAX_RESULT_AGE-self.ENTRANCE_BUDGET_MS/1000):
+                    # Never spend the last part of a fresh primary result's
+                    # lifetime on an optional pass. This is still a post-return
+                    # budget, not cancellation of a hung native GPU call.
+                    verifier_status = {'state': 'deferred',
+                        'error': 'Entrance check deferred to keep the primary result fresh; retrying on the next fresh frame'}
                 if (extra_view is not None and not self._stop.is_set() and epoch == self._epoch
-                        and generation == self._worker_generation and time.monotonic()-stamp < self.MAX_RESULT_AGE):
+                        and generation == self._worker_generation and extra_now >= verifier_retry_at
+                        and 0 <= extra_now-stamp < self.MAX_RESULT_AGE-self.ENTRANCE_BUDGET_MS/1000):
                     crop, rect = extra_view
                     try:
                         verifier.confidence = normal_confidence
@@ -354,8 +377,8 @@ class SemanticMonitor:
                         elapsed_ms = (time.monotonic()-view_started)*1000
                         if not verifier.available or verifier.provider != 'Intel graphics (OpenVINO)':
                             raise RuntimeError(verifier.status().get('error') or 'Entrance graphics check unavailable')
-                        if elapsed_ms > 500:
-                            raise RuntimeError('Entrance check exceeded its 500 ms processing budget')
+                        if elapsed_ms > self.ENTRANCE_BUDGET_MS:
+                            raise _EntranceBudgetExceeded('Entrance check exceeded its 500 ms processing budget')
                         # All boxes belong to ONE source frame. Combining model
                         # views cannot count as a second temporal observation.
                         width, height = rect[2], rect[3]
@@ -367,6 +390,18 @@ class SemanticMonitor:
                                           normal_detection_count=len(accepted))
                         view_diagnostics.append(diagnostic)
                         verifier_status = {**verifier.status(), 'state': 'ready', 'accepted': len(accepted)}
+                        verifier_retry_at = 0.
+                        verifier_backoff = self.ENTRANCE_RETRY_INITIAL
+                    except _EntranceBudgetExceeded as exc:
+                        # A transient contention spike is not a broken model.
+                        # Keep the already loaded GPU request, discard this
+                        # result and probe later on the existing worker. The
+                        # primary keeps running throughout the cooldown.
+                        verifier_retry_at = time.monotonic() + verifier_backoff
+                        verifier_backoff = min(verifier_backoff * 2, self.ENTRANCE_RETRY_MAX)
+                        verifier_status = {'state': 'cooldown', '_retry_at': verifier_retry_at,
+                            'error': f'{exc}; retrying after cooldown',
+                            'inference_ms': round(elapsed_ms, 3)}
                     except Exception as exc:
                         verifier_status = {'state': 'unavailable', 'error': f'{type(exc).__name__}: {exc}'[:240]}
                         verifier = None
@@ -627,8 +662,15 @@ class SemanticMonitor:
         report['observed_at'] = updated
         epoch = report.pop('_epoch', self._epoch)
         generation = report.pop('_generation', getattr(self, '_worker_generation', 0))
+        report['tracking_generation'] = [epoch, generation]
         retry_at = report.pop('_retry_at', None)
         report['retry_in_s'] = round(max(0, retry_at - time.monotonic()), 1) if retry_at else None
+        if isinstance(report.get('entrance_verifier'), dict):
+            verifier_report = dict(report['entrance_verifier'])
+            verifier_retry_at = verifier_report.pop('_retry_at', None)
+            if verifier_retry_at is not None:
+                verifier_report['retry_in_s'] = round(max(0., verifier_retry_at-time.monotonic()), 1)
+            report['entrance_verifier'] = verifier_report
         report['age_s'] = round(time.monotonic()-updated, 1) if updated else None
         if report.get('available') and (epoch != self._epoch
                 or generation != getattr(self, '_worker_generation', 0)

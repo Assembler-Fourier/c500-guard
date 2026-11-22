@@ -79,6 +79,31 @@ assert.equal(aiComputeLabel({provider:'CPU',entrance_verifier:{state:'unavailabl
 assert.equal(aiComputeLabel({}),'AI processing');
 """)
 
+    def test_recovery_countdown_is_visible_without_claiming_secondary_ready(self):
+        self.js(self.harness() + """
+ml.entrance_verifier={state:'cooldown',retry_in_s:4.2,error:'Slow <check> recovering'};
+renderSystem({ml});let html=$('system-grid').innerHTML;
+assert.ok(html.includes('Entrance check retrying'));
+assert.ok(html.includes('Retry in 5 s'));assert.ok(html.includes('Primary ready'));
+assert.ok(!html.includes('Entrance check ready'));
+assert.ok(html.includes('Slow &lt;check&gt; recovering'));
+ml.entrance_verifier={state:'ready',provider:'Intel graphics (OpenVINO)'};
+renderSystem({ml});html=$('system-grid').innerHTML;
+assert.ok(html.includes('Entrance check ready'));assert.ok(!html.includes('Retry in'));
+""")
+
+    def test_deferred_and_stale_retries_are_not_presented_as_current_checks(self):
+        self.js(self.harness() + """
+ml.entrance_verifier={state:'deferred',error:'Preserve fresh primary'};
+renderSystem({ml});let html=$('system-grid').innerHTML;
+assert.ok(html.includes('Entrance check deferred'));
+assert.ok(html.includes('Primary detector continues'));
+ml.entrance_verifier={state:'cooldown',retry_in_s:5};status.aiFresh=false;
+renderSystem({ml});html=$('system-grid').innerHTML;
+assert.ok(html.includes('Entrance check status unavailable'));
+assert.ok(!html.includes('Retry in 5 s'));
+""")
+
 
 if __name__ == '__main__':
     unittest.main()

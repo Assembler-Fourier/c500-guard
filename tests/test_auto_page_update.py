@@ -47,15 +47,15 @@ class ReloadRuleTests(unittest.TestCase):
         harness = r"""
 const vm=require('node:vm'),assert=require('node:assert/strict');
 let reloads=0,open=false;
-const ctx={page:'monitor',location:{reload:()=>reloads++},
+const ctx={page:'live',location:{reload:()=>reloads++},
  document:{querySelector:q=>q.startsWith('meta')?{content:'aaaaaaaaaaaa'}:(open?{}:null)}};
 vm.runInNewContext(SOURCE,ctx);
 ctx.maybeReloadForUpdate({ui_version:'aaaaaaaaaaaa'});assert.equal(reloads,0);      // same version
 ctx.maybeReloadForUpdate({ui_version:'bbbbbbbbbbbb',alarm:'main'});assert.equal(reloads,0);   // never mid-alarm
 open=true;ctx.maybeReloadForUpdate({ui_version:'bbbbbbbbbbbb'});assert.equal(reloads,0);open=false;  // dialog open
-vm.runInContext("page='zones'",vm.createContext(ctx));
-ctx.maybeReloadForUpdate({ui_version:'bbbbbbbbbbbb'});assert.equal(reloads,0);      // zone editor
-vm.runInContext("page='monitor'",ctx);
+vm.runInContext("page='setup'",vm.createContext(ctx));
+ctx.maybeReloadForUpdate({ui_version:'bbbbbbbbbbbb'});assert.equal(reloads,0);      // setup (zone editor)
+vm.runInContext("page='live'",ctx);
 ctx.maybeReloadForUpdate({ui_version:'bbbbbbbbbbbb'});assert.equal(reloads,1);      // safe: reload once
 ctx.maybeReloadForUpdate({ui_version:'cccccccccccc'});assert.equal(reloads,1);
 """
