@@ -11,7 +11,7 @@ let lastFrame = 0;
 let lastUI = 0;
 let frameRequest = 0;
 let eventKey = '';
-let trackKey = '';
+let trackKey = null;
 let announcementKey = '';
 let lastSound = -Infinity;
 let soundEnabled = false;
@@ -74,7 +74,7 @@ function setScenario(id) {
   const preservePause = simulation.paused;
   simulation.setScenario(id);
   simulation.setPaused(preservePause);
-  resetSoundClock(); eventKey = ''; trackKey = ''; announcementKey = '';
+  resetSoundClock(); eventKey = ''; trackKey = null; announcementKey = '';
   updateUI(simulation.snapshot());
   renderer.render(simulation.snapshot(), { zones });
 }
@@ -119,6 +119,7 @@ function updateUI(state) {
   $('speed').setAttribute('aria-label',`Playback speed: ${state.speed} times`);
   controlLabel('lighting', state.lighting, state.lighting === 'night' ? '☾ <span>Night</span>' : '☼ <span>Day</span>');
   $('lighting').setAttribute('aria-label',state.lighting === 'night'?'Switch to day view':'Switch to night view');
+  $('lighting').title = $('lighting').getAttribute('aria-label');
   const quiet = state.quietRemaining > .01;
   $('status-card').dataset.state = state.alarm ? 'alert' : quiet ? 'quiet' : 'watching';
   $('status-pill').textContent = state.paused ? 'Paused' : state.alarm ? 'Attention' : quiet ? 'Acknowledged' : 'Watching';
