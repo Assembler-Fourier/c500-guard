@@ -30,6 +30,18 @@ the published source for this release; authoring source and the bundled page mat
 
 ## Adversarial QA
 
-The [22 November audit](QA-2026-11-22.md) documents reproducible failures outside the existing
-regression suite, with trigger sequences and acceptance criteria for future fixes. A green suite
-does not close these findings. The ten-second quiet period is intentional and remains unchanged.
+The [22 November audit](QA-2026-11-22.md) records seven failures that the original suite missed.
+The subsequent [repair release](FIXES-2026-11-22.md) adds reproductions and fixes all seven, with
+complete reruns and accelerated decision tests. Passing tests does not establish real-camera
+recall. The ten-second quiet period is intentional and remains unchanged.
+
+
+## Accelerated traffic decision checks
+
+From a disposable development checkout with the test dependencies installed:
+
+```powershell
+python tools/simulate_traffic.py --episodes 60000 --seed 20261122 --output outputs/traffic-simulation.json
+```
+
+This standalone process supplies synthetic detector packets to the actual tracker, visit memory and alarm/acknowledgement methods. It uses isolated test fixtures and fake output services; do not point it at an active installation. Eight scenario families cover arrivals, followers, quiet-period boundaries, short occlusions, pedestrians and rejected observations. Idle timestamps are skipped: reported virtual hours are not hours of continuous video inference. Run each source comparison in a separate process because Python imports are cached. The complete unittest suite separately tests input guard, barrier, auto-acknowledgement and UI behavior. See [release validation](FIXES-2026-11-22.md).

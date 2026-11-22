@@ -43,7 +43,7 @@ function createTransport({production=false,fetcher=globalThis.fetch.bind(globalT
   if(!['ack','arm','disarm','test-tone','power/off','zones','barrier-calibration','feedback','alignment/calibrate','settings'].includes(action))throw new Error('Unsupported command.');
   const response=await fetcher('/'+action,{method:'POST',headers:{'Content-Type':'application/json','X-Via':'web'},body:JSON.stringify(payload),signal:AbortSignal.timeout(12000)});
   let data;try{data=await response.json();}catch{throw new Error('No command receipt. Check the live system before retrying.');}
-  if(!response.ok||data.ok!==true)throw new Error(data.error||data.message||data.reason||`Command rejected (${response.status})`);
+  if(!response.ok||data.ok!==true){const error=new Error(data.error||data.message||data.reason||`Command rejected (${response.status})`);error.receipt=data;throw error;}
   if(action==='ack'&&data.acknowledged!==true)throw new Error('That alarm has changed or was already acknowledged.');
   return data;
  }

@@ -1071,9 +1071,6 @@ class Watcher:
         self.zones = load_zones(Path(args.zones))
         # The chosen sound style decides which tones are written to disk.
         self.alarm_audio_settings = self._load_audio_settings(args.zones)
-        # The barrier left-up beep repeats with its sound file: write it with the configured interval.
-        import alarm_audio as _reminder_audio
-        _reminder_audio.set_reminder_period(self._load_barrier_rules(args.zones)['reminder_every_s'])
         self.sounds = ensure_sounds()
         self.buzzer = Buzzer(self.sounds, muted=args.silent)
         self.reader = FrameReader(args.source, args.fps, args.connect_grace, args.lost_after)
@@ -1272,6 +1269,7 @@ class Watcher:
         if self.semantic is not None:
             self.semantic.keep_frames = self.sightings.enabled
         self._settings_lock = threading.Lock()
+        self._view_settings_sync = {'saved': [], 'failed': [], 'pending': {}, 'revision': time.monotonic()}
         EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
         ps.rotate_log(EVENT_LOG, max_bytes=5_000_000)
 
@@ -1417,14 +1415,34 @@ class Watcher:
 
     def _switch_view(self, profile: Path, name: str) -> None:
         """Save the active zones back to their own profile, make the matching view active, restart."""
-        self._invalidate_pose_writes()
-        from zone_editor import _atomic_write
-        active = Path(self.args.zones)
-        current = getattr(self, 'view_name', None)
-        own = active.parent / "views" / (current or "anpr") / "zones.json"
-        if own.parent.is_dir():
-            _atomic_write(own, active.read_bytes())
-        _atomic_write(active, profile.read_bytes())
+        import settings_store
+        from zone_editor import _atomic_write, read_config, validate_config
+        # Settings and automatic view changes must not overwrite one another.
+        # The active file is the durable authority for desk-wide reminder choices,
+        # including after a profile copy failed or the watcher was restarted.
+        # Alignment calls this while holding _state_lock; a settings save may
+        # need that lock after saving zones. Never wait in the reverse order.
+        if not self._settings_lock.acquire(blocking=False):
+            raise OSError('Settings save is in progress; camera view change will retry')
+        try:
+            self._invalidate_pose_writes()
+            active = Path(self.args.zones)
+            current = getattr(self, 'view_name', None)
+            own = active.parent / "views" / (current or "anpr") / "zones.json"
+            rules = self._load_barrier_rules(active)
+            shared = {key: rules[key.split('.', 1)[1]] for key in self.SHARED_VIEW_SETTINGS}
+            original = read_config(profile)
+            updated, _changed = settings_store.apply_changes(original, shared)
+            if updated == original:
+                content = profile.read_bytes()
+            else:
+                updated = validate_config(updated, updated)
+                content = (json.dumps(updated, indent=1, ensure_ascii=False, allow_nan=False) + '\n').encode('utf-8')
+            if own.parent.is_dir():
+                _atomic_write(own, active.read_bytes())
+            _atomic_write(active, content)
+        finally:
+            self._settings_lock.release()
         self.log_event("view", f"camera view changed to {name}; zones and barriers for that view loaded")
         (STATE_DIR / 'restart-request').write_text(time.strftime('%Y-%m-%dT%H:%M:%S') + '\n', encoding='utf-8')
 
@@ -2513,7 +2531,8 @@ class Watcher:
             workflow = getattr(self, 'barrier_workflow', None)
             muted = workflow.mute_reminders() if workflow is not None else []
             # Quiet until each arm now up has closed (its confirmed up-period ends).
-            self._left_up_muted = {arm: row['since'] for arm, row in self._left_up_arms().items()}
+            self._left_up_muted = {**(getattr(self, '_left_up_muted', None) or {}),
+                                   **{arm: row['since'] for arm, row in self._left_up_arms().items()}}
             self.buzzer.set(None)
             self.loudness.end()
             self.log_event("reminder-muted", f"via {via}: barrier left up", routes=muted)
@@ -2555,6 +2574,9 @@ class Watcher:
         alarm_audio.configure(block)
         alarm_audio.set_theme(alarms.get("sound_theme") if isinstance(alarms, dict) else None)
         alarm_audio.set_start_level(alarms.get("start_level") if isinstance(alarms, dict) else None)
+        # Every reset (including the second constructor load) must restore the
+        # reminder interval before any caller regenerates its looping WAV.
+        alarm_audio.set_reminder_period(Watcher._load_barrier_rules(zones_path)['reminder_every_s'])
         return alarm_audio.settings()
 
     @staticmethod
@@ -2620,7 +2642,7 @@ class Watcher:
                           and not self._alignment_blocked
                           and workflow is not None
                           and self.barrier_rules.get('reminder', True)
-                          and (self._left_up_due() or workflow.status().get('reminder_active') is True))
+                          and (self._left_up_due() or self._served_arm_reminder_due(workflow.status())))
                 if active:
                     if self.loudness.kind != 'barrier_open':
                         self._reminder_seq = getattr(self, '_reminder_seq', 0) + 1
@@ -3386,6 +3408,7 @@ class Watcher:
         import alarm_audio
         config = read_config(Path(self.args.zones))
         return {"sections": settings_store.describe(config),
+                "view_sync": getattr(self, '_view_settings_sync', None),
                 "live": {"sound": alarm_audio.settings(), "barrier_rules": dict(self.barrier_rules),
                          "recordings": self.recorder.status() if getattr(self, 'recorder', None) else None,
                          "ai_interval_s": getattr(self.semantic, 'interval', None) if self.semantic else None,
@@ -3410,21 +3433,32 @@ class Watcher:
             _atomic_write(path, (json.dumps(updated, indent=1, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
             self._apply_live_settings(updated, changed)
             shared = {key: changes[key] for key in changed if key in self.SHARED_VIEW_SETTINGS}
+            sync = None
             if shared:
-                self._share_view_settings(path, shared)
+                # A later reminder save also retries any previously failed copy.
+                rules = self._load_barrier_rules(path)
+                shared = {key: rules[key.split('.', 1)[1]] for key in self.SHARED_VIEW_SETTINGS}
+                sync = self._share_view_settings(path, shared)
+                self._view_settings_sync = sync
             if 'system.name' in changed:
                 self.display_name = self._load_display_name(path)
         self.log_event('settings', ', '.join(f'{key}={changes[key]}' for key in changed)[:400])
-        return {"ok": True, "changed": changed}
+        if sync and sync['failed']:
+            names = ', '.join(row['view'] for row in sync['failed'])
+            return {"ok": False, "partial": True, "applied": True, "changed": changed,
+                    "error": f"Saved for this view, but reminder settings could not be saved to: {names}. Retry Save.",
+                    "view_sync": sync}
+        return {"ok": True, "changed": changed, **({'view_sync': sync} if sync is not None else {})}
 
     SHARED_VIEW_SETTINGS = ('barriers.reminder', 'barriers.reminder_after_s', 'barriers.reminder_every_s')
 
-    def _share_view_settings(self, active: Path, changes: dict) -> None:
+    def _share_view_settings(self, active: Path, changes: dict) -> dict:
         """The barrier-up reminder is one switch for the desk: copy it into each saved camera view as well, so a
         view change (which loads that view's own file) keeps what the operator chose. Nothing else is copied."""
         import settings_store
         from zone_editor import read_config, validate_config, _atomic_write
         folder = active.resolve().parent / "views"
+        result = {'saved': [], 'failed': [], 'pending': {}, 'revision': time.monotonic()}
         for profile in sorted(folder.glob("*/zones.json")) if folder.is_dir() else []:
             try:
                 original = read_config(profile)
@@ -3437,34 +3471,33 @@ class Watcher:
                     text = json.dumps(updated, indent=len(spaces.group(1)) if spaces else 1, ensure_ascii=False,
                                       allow_nan=False)
                     _atomic_write(profile, (text.replace("\n", newline) + newline).encode("utf-8"))
+                result['saved'].append(profile.parent.name)
             except Exception as exc:                        # noqa: BLE001 - the active view is already saved
                 self.log_event('settings', f'reminder setting not copied to view {profile.parent.name}: {exc}'[:300])
+                result['failed'].append({'view': profile.parent.name, 'error': str(exc)[:200]})
+        if result['failed']:
+            result['pending'] = dict(changes)
+        return result
 
     def _apply_live_settings(self, config: dict, changed: list) -> None:
         import alarm_audio
         args_zones = self.args.zones
+        theme_before, period_before = alarm_audio.theme(), alarm_audio.reminder_period()
         if any(key.startswith('alarms.') for key in changed):
-            theme_before = alarm_audio.theme()
             self.alarm_audio_settings = self._load_audio_settings(args_zones)
             self.ack_quiet_s = self._load_ack_quiet(args_zones)
             self.fault_remind_s = self._load_fault_remind(args_zones)
             self.soften_let_in = self._load_soften_let_in(args_zones)
-            if alarm_audio.theme() != theme_before:
-                sounds = ensure_sounds(force=True)
-                replace = getattr(self.buzzer, 'replace_sounds', None)
-                if replace is not None:
-                    replace(sounds)
-                self.sounds = sounds
         if any(key.startswith('barriers.') for key in changed):
             self.barrier_rules = self._load_barrier_rules(args_zones)
             self._apply_barrier_rules()
-            period = alarm_audio.reminder_period()
-            if alarm_audio.set_reminder_period(self.barrier_rules['reminder_every_s']) != period:
-                sounds = ensure_sounds(force=True)          # the beep repeats with its file
-                replace = getattr(self.buzzer, 'replace_sounds', None)
-                if replace is not None:
-                    replace(sounds)
-                self.sounds = sounds
+            alarm_audio.set_reminder_period(self.barrier_rules['reminder_every_s'])
+        if alarm_audio.theme() != theme_before or alarm_audio.reminder_period() != period_before:
+            sounds = ensure_sounds(force=True)              # the beep repeats with its file
+            replace = getattr(self.buzzer, 'replace_sounds', None)
+            if replace is not None:
+                replace(sounds)
+            self.sounds = sounds
         if any(key in changed for key in ('ai.interval_s', 'ai.whole_picture')) and self.semantic is not None:
             self.semantic.interval = self._load_ai_interval(args_zones)
             self.semantic.context_view = self._load_ai_whole_picture(args_zones)
@@ -3666,8 +3699,8 @@ class Watcher:
     def _note_arm_memory(self, status) -> None:
         """Each arm's last confirmed position and since when; every real change is logged ("arm").
 
-        Display and history only. The strict reading (which drops to unknown while glare, a vehicle or the
-        moving arm hides it) still decides every acknowledgement.
+        History and left-up reminders only. The strict reading (which drops to unknown while glare, a vehicle or
+        the moving arm hides it) still decides every acknowledgement.
         """
         try:
             memory = getattr(self, '_arm_memory', None)
@@ -3685,8 +3718,16 @@ class Watcher:
                         or not row.get('fresh') or not row.get('calibrated')):
                     continue
                 previous = memory.get(arm)
+                if self._tracker_agrees(arm, state) is False:
+                    # Preserve the historical period and its mute, but a current
+                    # contradiction cannot refresh or sustain a left-up reminder.
+                    if previous is not None:
+                        previous['reminder_blocked'] = True
+                    self._arm_pending.pop(arm, None)
+                    continue
                 if previous is not None and previous['state'] == state:
                     previous['seen'] = now
+                    previous.pop('reminder_blocked', None)
                     self._arm_pending.pop(arm, None)
                     continue
                 if previous is not None and not self._arm_change_confirmed(arm, state, now):
@@ -3710,7 +3751,9 @@ class Watcher:
         rows = {}
         for arm, item in dict(getattr(self, '_arm_memory', None) or {}).items():
             try:
-                if item['state'] == 'up' and 0 <= now - item['seen'] <= self.LEFT_UP_SEEN_S:
+                if (item['state'] == 'up' and not item.get('reminder_blocked')
+                        and self._tracker_agrees(arm, 'up') is not False
+                        and 0 <= now - item['seen'] <= self.LEFT_UP_SEEN_S):
                     rows[arm] = {'up_s': max(0., now - item['since']), 'since': item['since'],
                                  'muted': muted.get(arm) == item['since']}
             except (KeyError, TypeError):
@@ -3721,6 +3764,22 @@ class Watcher:
         """An arm has been up for the reminder delay and nobody has silenced it for this up-period."""
         after = self.barrier_rules.get('reminder_after_s', 60.)
         return any(row['up_s'] >= after and not row['muted'] for row in self._left_up_arms(now).values())
+
+    def _served_arm_reminder_due(self, status) -> bool:
+        """The earlier served-arm timer needs the same current arm proof as the general reminder."""
+        if status.get('trusted') is not True or status.get('reminder_active') is not True:
+            return False
+        routes = (status.get('service') or {}).get('routes') or {}
+        groups = BarrierWorkflow._groups(self.zones)
+        for arm, row in self._left_up_arms().items():
+            if row['muted']:
+                continue
+            compatible = {route: members for route, members in groups.items()
+                          if all(zone.route_role in ('', arm) for zone in members)}
+            route = BarrierWorkflow._route_for(arm, compatible)
+            if (routes.get(route) or {}).get('reminder_active') is True:
+                return True
+        return False
 
     def _note_lane_seen(self, primary) -> None:
         """Wall time an AI vehicle (road lanes) or person (footpath) was last seen in each route's zones."""
@@ -4760,6 +4819,7 @@ class Watcher:
         return {
             "armed": self.armed,
             "barriers": self.barrier_status(),
+            "view_sync": getattr(self, '_view_settings_sync', None),
             "lanes": self._lane_seen_status(),
             "control_warning": self.control_warning,
             "alarm": self.alarm,

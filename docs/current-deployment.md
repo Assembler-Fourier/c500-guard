@@ -1,3 +1,31 @@
+# Deployed QA repairs — 22 November 2026
+
+The seven reproduced QA defects are now repaired. Read the [release evidence and limits](FIXES-2026-11-22.md). The following-car fix preserves distinct observed visits while retaining the ten-second acknowledgement policy.
+
+| Check | Result | Scope |
+|---|---|---|
+| Frozen complete application suite | 2,062 run; 2,058 passed; 4 skipped; 485.945s | Isolated state; no source drift |
+| Sanitized public package | 2,062 run; 2,014 passed; 48 skipped; 465.107s | No private scene fixtures distributed |
+| Separate vehicle-report suite | 26 passed; 6.407s | Synthetic appearance records; unchanged module |
+| Accelerated traffic | 60,000 episodes; 52,500 vehicles; 22,500 people; 7,500 negative episodes; no assertion failures | 1,665,000 observation packets; 2,000 virtual hours; 350.57s wall time |
+| Two-arm stress regression | 10,000 complete cycles passed | Included in the full suite, not an additional test-method count |
+| Recorded-observation comparison | Four clips, 432 observations; exact IDs and first-event times preserved | Cached real-model boxes, not new inference |
+| Post-install health | 12 consecutive healthy samples | Actual restarted watcher, camera, AI, input and served UI |
+
+The initial complete private/public runs each had eight failures in JavaScript test harnesses. Six extracted a newly added event listener without its DOM; two omitted a new transport global. Function extraction boundaries and test globals were corrected; all 14 existing methods and 92 JavaScript assertion fragments in the two affected files were retained. No application code changed between the large traffic run and the final full suites. The initial failed logs remain local. The final complete reruns above passed.
+
+Public skips retain the original optional/private-fixture assertions: 42 labelled scene fixtures, two private PTZ incidents, one private reference, one model smoke-image opt-in, and two real app-lifecycle opt-ins. Private-suite skips are its four optional smoke/reference/app checks as recorded by that runner. No live OFF/F4 exercise is claimed.
+
+Installed 12 allowlisted source/test files with verified backups and a supervised refresh. Installed SHA-256 hashes match the tested stage. Alerts remained **armed**, matching the pre-refresh state. The final operational sample had fresh camera/input/AI data and no fault; the one-second input guard and ten-second quiet period were unchanged. The generated reminder WAV is 10 seconds, matching the configured period. Active configuration and nine of ten monitored runtime archives retained their hashes, including every barrier template and the primary alignment reference. The existing startup learner refreshed one lighting-reference cache at 01:16:18; its logged update, unchanged learning methods and six valid reference arrays were reviewed and its exact new hash was accepted. The initial blanket hash-check failure is retained. Served dashboard/settings pages contain the new retry flow.
+
+The two-second entrance test was accepted, playback was observed starting and stopping without an error, and speaker volume returned to its prior value. Human audibility was not confirmed.
+
+The editable UI source is synchronized to the tested bundle before publication; future builds must use `tools/build_ui.py` from a development checkout. Physical vehicle arrivals and speaker audibility are not established by simulated alarms or an accepted test-tone request.
+
+---
+
+## Previous audit checkpoint
+
 # Source publication and QA — 22 November 2026
 
 This is a publication of the implementation already present after the 21 November releases, plus independent QA and research. **No application fixes or new deployment occurred during this audit.** Seven reproduced defects remain open, including a P1 missed-follower alarm. Read the [QA findings](QA-2026-11-22.md) before treating test success as readiness.

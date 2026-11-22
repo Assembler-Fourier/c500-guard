@@ -10,7 +10,7 @@ class SettingsInteractionTests(unittest.TestCase):
     def harness(self):
         shown = PAGE.split('function shown(', 1)[1].split('function rowFor(', 1)[0]
         update = PAGE.split('function updateControl(', 1)[1].split('async function load(', 1)[0]
-        save = PAGE.split('async function save(', 1)[1].split("$('test').addEventListener", 1)[0]
+        save = PAGE.split('async function save(', 1)[1].split("$('settings-sync-retry').addEventListener", 1)[0]
         return r'''
 let loadVersion=0,loads=0,calls=[],messages=[],pending=[];
 const load=()=>{loads++},toast=(...args)=>messages.push(args),setTimeout=()=>0;
@@ -57,7 +57,9 @@ assert.equal(a.value,.2);assert.equal(b.value,'pulses');assert.equal(loads,0);as
 
     def test_transport_requires_explicit_receipt_and_bounds_wait(self):
         post = PAGE.split('async function post(', 1)[1].split('async function save(', 1)[0]
-        self.js(r'''let callback,cleared=0,lastRequest;const setTimeout=(fn,ms)=>{assert.equal(ms,10000);callback=fn;return 1},clearTimeout=()=>cleared++;
+        self.js(r'''let pendingSettingsChanges=null,settingsRequestBusy=false;
+const showSettingsRetry=changes=>{pendingSettingsChanges=changes;};
+let callback,cleared=0,lastRequest;const setTimeout=(fn,ms)=>{assert.equal(ms,10000);callback=fn;return 1},clearTimeout=()=>cleared++;
 let response={ok:true,status:200,json:async()=>({})};const fetch=async(path,options)=>{lastRequest=options;return response};
 '''+'async function post('+post+r'''
 await assert.rejects(post('/settings',{}),/did not confirm/);assert.equal(cleared,1);assert.ok(lastRequest.signal);
@@ -67,7 +69,9 @@ response={ok:false,status:400,json:async()=>({ok:false,error:'Invalid value'})};
 
     def test_response_body_timeout_keeps_uncertain_result_warning(self):
         post = PAGE.split('async function post(', 1)[1].split('async function save(', 1)[0]
-        self.js(r'''let cleared=0;const setTimeout=()=>1,clearTimeout=()=>cleared++;
+        self.js(r'''let pendingSettingsChanges=null,settingsRequestBusy=false;
+const showSettingsRetry=changes=>{pendingSettingsChanges=changes;};
+let cleared=0;const setTimeout=()=>1,clearTimeout=()=>cleared++;
 const fetch=async()=>({ok:true,status:200,json:async()=>{const e=new Error('aborted');e.name='AbortError';throw e}});
 '''+'async function post('+post+r'''
 await assert.rejects(post('/settings',{}),/may have applied; check this setting before retrying/);assert.equal(cleared,1);

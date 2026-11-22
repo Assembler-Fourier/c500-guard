@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+import struct
 
 from region_geometry import point_in_polygon
 
@@ -18,6 +19,12 @@ VEHICLE_LABELS = frozenset({'car', 'bus', 'truck'})
 
 def _family(label):
     return 'large_vehicle' if label in VEHICLE_LABELS else label
+
+
+def _confidence_threshold(value, raw_confidence):
+    # Decoder scores are float32. Match its boundary (not display rounding),
+    # while adapters without raw scores keep their existing float comparison.
+    return struct.unpack('f', struct.pack('f', value))[0] if raw_confidence is not None else value
 
 
 def _iou(a, b):
@@ -61,7 +68,8 @@ def _confirmation_window(zone):
     return min(1.5, max(0., float(value)))
 
 
-def _strong_confirmation(visit, zone, label, confidence, ground, now, eligible, count):
+def _strong_confirmation(visit, zone, label, confidence, ground, now, eligible, count,
+                         raw_confidence=None):
     """Optional two-frame stop-line proof; retain the ordinary weaker path.
 
     Both observations must belong to this visit, pass its existing direction
@@ -74,7 +82,9 @@ def _strong_confirmation(visit, zone, label, confidence, ground, now, eligible, 
             or count < 3 or getattr(zone, 'alert_stage', '') != 'barrier'
             or not getattr(zone, 'confirmation_polygon', None)
             or label not in {'car', 'motorcycle', 'bus', 'truck'}
-            or not eligible or confidence < threshold):
+            or not eligible
+            or (raw_confidence if raw_confidence is not None else confidence)
+                < _confidence_threshold(threshold, raw_confidence)):
         visit.strong_confirmation_samples.clear()
         return False
     samples = visit.strong_confirmation_samples
@@ -82,6 +92,7 @@ def _strong_confirmation(visit, zone, label, confidence, ground, now, eligible, 
         samples.clear()
     if not samples or now > samples[-1]['observed_at']:
         samples.append({'observed_at': now, 'confidence': confidence,
+                        **({'raw_confidence': raw_confidence} if raw_confidence is not None else {}),
                         'ground_point': tuple(ground), 'direction_state': visit.direction_state})
     del samples[:-2]
     return len(samples) == 2 and 0 < samples[-1]['observed_at']-samples[0]['observed_at'] <= 1.
@@ -120,6 +131,26 @@ def _track_score(track, bbox, now):
         # Uncertain, short or stale trajectories retain the legacy fallback.
         return forecast + .05
     return max(raw or 0., forecast + .05)
+
+
+def _recent_motion_supports(track, bbox, now, previous_update):
+    """Narrow evidence for a moving follower over a missing co-visible track."""
+    elapsed = now - track.last_seen
+    confidence = track.confidence if track.raw_confidence is None else track.raw_confidence
+    if (previous_update is None or track.last_seen != previous_update
+            or not .05 <= elapsed <= .75 or track.label not in VEHICLE_LABELS
+            or len(track.trail) < 3 or confidence < .5 or track.velocity is None):
+        return False
+    vx, vy = track.velocity
+    speed = math.hypot(vx, vy)
+    old, new = _ground(track.bbox), _ground(bbox)
+    dx, dy = new[0]-old[0], new[1]-old[1]
+    distance = math.hypot(dx, dy)
+    if speed < .02 or distance < .005 or vx*dx+vy*dy < .8*speed*distance:
+        return False
+    predicted = (track.bbox[0]+vx*elapsed, track.bbox[1]+vy*elapsed,
+                 track.bbox[2]+vx*elapsed, track.bbox[3]+vy*elapsed)
+    return _iou(predicted, bbox) >= .5
 
 
 def zone_accepts(zone, label, point):
@@ -265,6 +296,7 @@ class _Track:
     bbox: tuple
     last_seen: float
     confidence: float = 0.
+    raw_confidence: float | None = None
     visits: dict = field(default_factory=dict)
     routes: dict = field(default_factory=dict)
     velocity: tuple | None = None
@@ -274,6 +306,7 @@ class _Track:
     first_ground: tuple | None = None
     groups_seen: set = field(default_factory=set)  # route groups with confirmed, eligible visits
     ground_samples: list = field(default_factory=list)  # bounded source-timed motion proof
+    co_visible_tracks: set = field(default_factory=set)  # independent IDs actually seen together
 
 
 class ObjectVisitTracker:
@@ -349,6 +382,8 @@ class ObjectVisitTracker:
                             'track_id': track.id, 'label': track.label,
                             'bbox_normalized': [round(value, 6) for value in track.bbox],
                             'confidence': track.confidence,
+                            **({'raw_confidence': track.raw_confidence}
+                               if track.raw_confidence is not None else {}),
                             'direction_state': visit.direction_state,
                             'observations': 2 if fast_proof else visit.confirmation_hits,
                             'confirmation_required': bool(getattr(zones[index], 'confirmation_polygon', None)),
@@ -456,8 +491,10 @@ class ObjectVisitTracker:
     def update(self, objects, zones, width, height, now):
         if width <= 0 or height <= 0 or not math.isfinite(now):
             raise ValueError('Tracking requires a finite time and positive image dimensions')
-        if self._last_update is not None and now < self._last_update:
+        previous_update = self._last_update
+        if previous_update is not None and now < previous_update:
             self.reset()
+            previous_update = None
         self._last_update = now
         self._tracks = {key: value for key, value in self._tracks.items()
                         if now - value.last_seen <= self.lost_after}
@@ -482,19 +519,46 @@ class ObjectVisitTracker:
                 confidence = float(obj.get('confidence', 0.))
                 if not math.isfinite(confidence) or not 0 <= confidence <= 1:
                     continue
-                detections.append((obj, label, bbox, confidence))
+                raw_confidence = obj.get('raw_confidence')
+                if 'raw_confidence' in obj and (isinstance(raw_confidence, bool)
+                        or not isinstance(raw_confidence, (int, float))
+                        or not math.isfinite(raw_confidence) or not 0 <= raw_confidence <= 1):
+                    continue
+                detections.append((obj, label, bbox, confidence, raw_confidence))
             except (KeyError, TypeError, ValueError, OverflowError):
                 continue
 
         candidates = []
         for track in self._tracks.values():
-            for index, (_, label, bbox, _) in enumerate(detections):
+            for index, (_, label, bbox, _, _) in enumerate(detections):
                 if _family(track.label) == _family(label):
                     score = _track_score(track, bbox, now)
                     if score is not None:
                         candidates.append((-score, track.id, index))
         matched_tracks, assignments = set(), {}
-        for _, track_id, index in sorted(candidates):
+        ordered = sorted(candidates)
+        best_by_track, by_detection = {}, {}
+        for candidate in ordered:
+            _, track_id, index = candidate
+            best_by_track.setdefault(track_id, index)
+            by_detection.setdefault(index, []).append(candidate)
+        preferred = []
+        for candidate in ordered:
+            _, track_id, index = candidate
+            track = self._tracks[track_id]
+            if (best_by_track[track_id] != index
+                    or not _recent_motion_supports(track, detections[index][2], now, previous_update)):
+                continue
+            stronger = [other for other in by_detection[index] if other < candidate]
+            if stronger and all(other_id in track.co_visible_tracks
+                                and self._tracks[other_id].last_seen < previous_update
+                                for _, other_id, _ in stronger):
+                # A stale lead's last box can have higher IoU than the moving
+                # follower behind it. Reserve only that follower's best motion
+                # match; all stronger rivals must be missing, proven separate.
+                # Other boxes remain available if the old car reappears too.
+                preferred.append(candidate)
+        for _, track_id, index in preferred + ordered:
             if track_id not in matched_tracks and index not in assignments:
                 assignments[index] = self._tracks[track_id]
                 matched_tracks.add(track_id)
@@ -513,7 +577,7 @@ class ObjectVisitTracker:
                     visit.allowed = False
 
         events, observed = [], []
-        for index, (obj, label, bbox, confidence) in enumerate(detections):
+        for index, (obj, label, bbox, confidence, raw_confidence) in enumerate(detections):
             track = assignments.get(index)
             if track is None:
                 if len(self._tracks) >= self.max_tracks:
@@ -537,6 +601,8 @@ class ObjectVisitTracker:
                     track.velocity = None
             track.label, track.bbox, track.last_seen = label, bbox, now
             track.confidence = confidence
+            track.raw_confidence = raw_confidence
+            score = confidence if raw_confidence is None else raw_confidence
             ground = _ground(bbox)
             track.trail.append((round(ground[0], 4), round(ground[1], 4)))
             del track.trail[:-10]
@@ -561,9 +627,10 @@ class ObjectVisitTracker:
                 visit = track.visits.get(zone_index)
                 if inside:
                     current_zones.append(zone.name)
-                    threshold = getattr(zone, 'ai_confidence', 0.)
+                    threshold = _confidence_threshold(getattr(zone, 'ai_confidence', 0.), raw_confidence)
                     floor = _weak_floor(zone)
-                    weak = (confidence < threshold and floor is not None and confidence >= floor
+                    weak = (score < threshold and floor is not None
+                            and score >= _confidence_threshold(floor, raw_confidence)
                             and _direction(zone) is not None)
                     entry = getattr(zone, 'ai_moving_entry_polygon', None)
                     entry_missing = bool(weak and entry and (visit is None or not visit.active)
@@ -576,7 +643,7 @@ class ObjectVisitTracker:
                         # Normal observations can still confirm a vehicle first
                         # visible mid-lane; confirmed identities remain intact.
                         weak = False
-                    if confidence < threshold and not weak:
+                    if score < threshold and not weak:
                         if visit is not None:
                             visit.hits = 0
                             visit.weak_hits = 0
@@ -648,7 +715,7 @@ class ObjectVisitTracker:
                         allowed = allowed and recent_progress >= getattr(zone, 'arrival_min_progress', .012)
                     strong_confirmed = _strong_confirmation(
                         visit, zone, label, confidence, ground, now,
-                        allowed and not was_away, count)
+                        allowed and not was_away, count, raw_confidence)
                     # One extra observation only when the strong ones alone are not enough.
                     needed = count + (1 if visit.weak_hits and visit.hits - visit.weak_hits < count else 0)
                     visit.strong_confirmation_used = strong_confirmed and visit.confirmation_hits < needed
@@ -700,4 +767,9 @@ class ObjectVisitTracker:
                                            if key < len(zones)},
                              'confirmed_regions': [zones[key].name for key, visit in track.visits.items()
                                                    if visit.active and visit.allowed and key < len(zones)]})
+        visible_ids = {obj['track_id'] for obj in observed}
+        for track_id in visible_ids:
+            track = self._tracks[track_id]
+            track.co_visible_tracks.intersection_update(self._tracks)
+            track.co_visible_tracks.update(visible_ids - {track_id})
         return events, observed

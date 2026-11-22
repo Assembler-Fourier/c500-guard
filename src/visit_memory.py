@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+import struct
 import threading
 
 from region_geometry import point_in_polygon
@@ -40,6 +41,16 @@ def _family(label):
     return 'vehicle' if label in ('car', 'truck', 'bus') else label
 
 
+def _confidence_meets(details, threshold):
+    confidence = details.get('confidence')
+    if not _number(confidence) or not 0 <= confidence <= 1:
+        return False
+    if 'raw_confidence' in details:
+        confidence = details['raw_confidence']
+        threshold = struct.unpack('f', struct.pack('f', threshold))[0]
+    return _number(confidence) and threshold <= confidence <= 1
+
+
 def _strong_stopline_proof(details, zone, now, freshness_s):
     """Validate the tracker's explicit two-frame proof without weakening visits."""
     threshold = _get(zone, 'ai_fast_confirm_confidence', 0.)
@@ -61,10 +72,9 @@ def _strong_stopline_proof(details, zone, now, freshness_s):
     for sample in proof:
         if not isinstance(sample, dict):
             return False
-        stamp, confidence, point = (sample.get('observed_at'), sample.get('confidence'),
-                                    sample.get('ground_point'))
+        stamp, point = sample.get('observed_at'), sample.get('ground_point')
         if (not _number(stamp) or not 0 <= now-stamp < freshness_s
-                or not _number(confidence) or not max(threshold, _get(zone, 'ai_confidence', 0.)) <= confidence <= 1.
+                or not _confidence_meets(sample, max(threshold, _get(zone, 'ai_confidence', 0.)))
                 or not isinstance(point, (list, tuple)) or len(point) != 2
                 or not all(_number(value) and 0 <= value <= 1 for value in point)
                 or sample.get('direction_state') not in permitted
@@ -77,6 +87,7 @@ def _strong_stopline_proof(details, zone, now, freshness_s):
                 and 0 < last['observed_at']-first['observed_at'] <= 1.
                 and last['observed_at'] == details.get('observed_at')
                 and last['confidence'] == details.get('confidence')
+                and last.get('raw_confidence') == details.get('raw_confidence')
                 and last['direction_state'] == details.get('direction_state')
                 and _number(details.get('first_observed_at'))
                 and details['first_observed_at'] <= first['observed_at']
@@ -184,7 +195,8 @@ class VisitMemory:
                     continue
                 by_name[str(_get(zone, 'name', ''))] = route
                 state = routes.setdefault(route, {'signal': False, 'occupied': False,
-                    'ml_fresh': False, 'frame_fresh': bool(frame_fresh), 'observed_at': now})
+                    'ml_fresh': False, 'frame_fresh': bool(frame_fresh), 'observed_at': now,
+                    'visible_tracks': set()})
                 state['signal'] |= bool(_get(zone, 'motion_active', False) or _get(zone, 'light_active', False)
                                         or _get(zone, 'approach_motion_active', False))
             ml = ml if isinstance(ml, dict) else {}
@@ -213,6 +225,9 @@ class VisitMemory:
                                      if isinstance(name, str) and name in by_name}
                                     if isinstance(confirmed_regions, list) else set())
                 track = str(obj['track_id']) if obj.get('track_id') is not None else None
+                if track is not None:
+                    for route in object_routes:
+                        routes[route]['visible_tracks'].add(track)
                 bbox = _box(obj.get('bbox_normalized'))
                 raw_box = obj.get('bbox')
                 if bbox is None and isinstance(raw_box, (list, tuple)) and len(raw_box) == 4 and width > 0 and height > 0:
@@ -313,6 +328,12 @@ class VisitMemory:
                     # cars, even overlapping cars, must retain separate visits.
                     candidates = [item for item in active if item.confirmed and item.bbox
                         and _family(item.label) == _family(label)
+                        # Co-visibility already proved this is another object.
+                        # Its later overlap cannot override that identity fact.
+                        and track not in item.separate_tracks
+                        # A full bounded set may have omitted another follower.
+                        # Ambiguity may repeat a warning, never silently merge it.
+                        and len(item.separate_tracks) < 100
                         and not (item.track_ids & self._visible_tracks)
                         and 0 <= now-item.last_seen <= self.reidentify_s
                         and _iou(item.bbox, bbox) >= .35]
@@ -355,6 +376,15 @@ class VisitMemory:
                                bbox=bbox, confirmed=track is not None,
                                last_confirmed=stamp if track is not None else None)
                 self._visits[ident] = visit
+            if track in self._visible_tracks:
+                # observe() precedes consideration. Remember this frame too:
+                # a new visit (or alias) did not yet exist when observe ran.
+                # Keep the existing route scope of the unanswered-visit policy.
+                together = self._routes.get(route, {}).get('visible_tracks', set())
+                for other in sorted(together - visit.track_ids):
+                    if len(visit.separate_tracks) >= 100:
+                        break
+                    visit.separate_tracks.add(other)
             if visit.emitted:
                 self._suppressed += 1
             return VisitDecision(visit.id, visit.emitted,
@@ -409,9 +439,8 @@ class VisitMemory:
                 return None
             if same_advance and (approach is not barrier or _get(approach,'ai_context') is not True):
                 return None
-            confidence = details.get('confidence')
             observations = details.get('observations')
-            if (not _number(confidence) or not _get(barrier,'ai_confidence',0) <= confidence <= 1
+            if (not _confidence_meets(details, _get(barrier,'ai_confidence',0))
                     or type(observations) is not int
                     or (observations < _get(barrier,'ai_confirm_observations',2)
                         and not _strong_stopline_proof(details, barrier, now, self.freshness_s))):

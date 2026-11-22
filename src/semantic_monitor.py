@@ -241,7 +241,7 @@ class SemanticMonitor:
                     and getattr(z, 'ai_enabled', False) and getattr(z, 'classes', None) != []]
         if not entrance:
             return None
-        whole = [view for view in views if len(view) > 2 and view[2] == 'context'
+        whole = [view for view in views if len(view) > 2 and view[2] in {'context', 'focused whole'}
                  and view[1][0] == 0 and view[1][1] == 0]
         # Wider visual context proved more reliable than the narrow entrance
         # crop in the clean missed-car recording. Only entrance ground points
@@ -336,10 +336,11 @@ class SemanticMonitor:
                         raise RuntimeError(detector.status().get('error') or 'Local AI inference failed')
                     normal = (self._normal_detections(detections, normal_confidence)
                               if detector.confidence < normal_confidence else detections)
-                    (context_results if len(item) > 2 else view_results).append((normal, rect))
+                    is_context = len(item) > 2 and item[2] == 'context'
+                    (context_results if is_context else view_results).append((normal, rect))
                     if len(view_diagnostics) < self.MAX_DIAGNOSTIC_VIEWS:
                         diagnostic = self._view_diagnostics(
-                            detections, rect, 'context' if len(item) > 2 else 'focused', view_ms)
+                            detections, rect, 'context' if is_context else 'focused', view_ms)
                         diagnostic.update(observed_at=stamp, epoch=epoch, generation=generation,
                                           normal_detection_count=len(normal))
                         view_diagnostics.append(diagnostic)
@@ -604,8 +605,16 @@ class SemanticMonitor:
                 # tracking so two model passes cannot count as two observations.
                 views = [(np.asarray(frame[y1:y2, x1:x2], dtype=np.uint8).copy(), rect)
                          for rect in rects for x1, y1, x2, y2 in [rect]]
-                if self.context_view and not any(rect == (0, 0, w, h) for rect in rects):
-                    views.append((np.asarray(frame, dtype=np.uint8).copy(), (0, 0, w, h), 'context'))
+                if self.context_view:
+                    if (0, 0, w, h) in rects:
+                        # This focused crop already is the complete picture.
+                        # Preserve its primary merge semantics and reuse these
+                        # pixels for the optional verifier, without another
+                        # primary pass or another temporal observation.
+                        index = rects.index((0, 0, w, h))
+                        views[index] = (*views[index], 'focused whole')
+                    else:
+                        views.append((np.asarray(frame, dtype=np.uint8).copy(), (0, 0, w, h), 'context'))
                 # Cropping can itself be delayed under contention. Check again
                 # instead of handing already expired pixels to the worker.
                 whole = None

@@ -128,7 +128,7 @@ assert.equal(timers.filter(([,ms])=>ms===250).length,1,'Only the current request
 
     def test_frame_decode_timeout_releases_polling_and_discards_the_late_image(self):
         frame = "async function readFrame(" + self.source(
-            "async function readFrame(", "document.querySelectorAll('[data-page]')")
+            "async function readFrame(", "// WIRING")
         self.js("""
 let active=true,frameRunning=false,frameController=null,displayedFrame='blob:initial',lastFrameAt=1000;
 let page='live',mode='live',connectionOk=true,now=1000,fetches=0;
@@ -159,7 +159,7 @@ assert.equal(revoked.filter(url=>url==='blob:1').length,1);
 
     def test_pre_restore_frame_cannot_replace_the_new_live_picture(self):
         frame = "async function readFrame(" + self.source(
-            "async function readFrame(", "document.querySelectorAll('[data-page]')")
+            "async function readFrame(", "// WIRING")
         lifecycle = "\n".join(line for line in self.page.splitlines()
                               if line.startswith("window.addEventListener('pagehide',()=>{active=false")
                               or line.startswith("window.addEventListener('pageshow'"))

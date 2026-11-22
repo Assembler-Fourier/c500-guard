@@ -20,6 +20,7 @@ let page='live',setupTab='camera',showZones=true,events=[],activityFilter='all',
 let displayedFrame=null,lastFrameAt=0,frameRunning=false,active=true,renderedOverlay='',renderedEvents='',renderedActivity='',renderedRoutes='';
 let historyPoints=[],lastHistoryFrame=null,toastTimer=null,stateController=null,frameController=null;
 let commandBusy=false,shutdownRequested=false,configurationBusy=false,configurationTimer=null,lastStateAt=0,lastAckAt=0;
+let pendingSettingsRetry=null;
 const roleMeta={entrance:{name:'Entrance',color:'var(--entry)',icon:'enter'},exit:{name:'Exit',color:'var(--exit)',icon:'exit'},pedestrian:{name:'Footpath',color:'var(--path)',icon:'walk'}};
 const editor=initZones({imageUrl:transport.path('/api/scene.jpg'),getState:()=>({...mergedLive(),_uiConnected:connectionOk}),onToast:toast,production,onApply:applyZones});
 const setupVisible=tab=>page==='setup'&&setupTab===tab;
@@ -153,10 +154,15 @@ async function runCommand(action,payload={}){
    lastAckAt=performance.now();toast('Acknowledged · this visit stays quiet');
   }else if(action==='arm'||action==='disarm'){liveState.armed=result.armed;toast(result.control_warning||(result.armed?'Alerts resumed':'Alerts paused · the program keeps running'));}
   else if(action==='test-tone')toast('Alarm test started');
-  else if(action==='settings'&&'barriers.reminder' in (payload.changes||{}))toast(payload.changes['barriers.reminder']?'Barrier-up reminder on':'Barrier-up reminder off');
- }catch(error){toast(error.message);}
+  else if(action==='settings'){
+   if(result.view_sync)applySettingsSync(result.view_sync);else if(pendingSettingsRetry){for(const key of Object.keys(payload.changes||{}))delete pendingSettingsRetry.changes[key];if(!Object.keys(pendingSettingsRetry.changes).length)pendingSettingsRetry=null;renderSettingsRetry();}
+   if('barriers.reminder' in (payload.changes||{}))toast(payload.changes['barriers.reminder']?'Barrier-up reminder on':'Barrier-up reminder off');
+  }
+ }catch(error){if(action==='settings'&&error.receipt?.partial===true){if(error.receipt.view_sync)applySettingsSync(error.receipt.view_sync,error.message);else{pendingSettingsRetry={changes:{...(pendingSettingsRetry?.changes||{}),...(payload.changes||{})}};renderSettingsRetry(error.message);}}toast(error.message);}
  finally{commandBusy=false;render();}
 }
+function renderSettingsRetry(message){const notice=$('settings-sync-warning');if(!notice)return;notice.hidden=!pendingSettingsRetry;if(message)$('settings-sync-message').textContent=message;}
+function applySettingsSync(sync,message){const revision=Number(sync?.revision);if(Number.isFinite(revision)&&revision<(renderSettingsRetry.revision??-1))return;if(Number.isFinite(revision))renderSettingsRetry.revision=revision;const changes=sync?.pending;pendingSettingsRetry=changes&&Object.keys(changes).length?{changes:{...changes}}:null;renderSettingsRetry(message);}
 async function applyZones(draft,baseline){
  if(!production)throw new Error('Preview is read only.');
  const state=await transport.read('/api/state',AbortSignal.timeout(4500));
@@ -263,6 +269,7 @@ function audioStageLabel(plan){
 }
 function soundReady(s){const audio=s.audio||{};const error=typeof audio.playback?.error==='string'?audio.playback.error.trim():'';return connectionOk&&!error&&audio.available===true&&audio.muted===false&&finite(audio.volume)&&audio.volume>0;}
 function render(){
+ if(liveState.view_sync)applySettingsSync(liveState.view_sync);
  const s=currentState(),status=deriveStatus(s,connectionOk);
  if(shutdownRequested){Object.assign(status,{tone:'neutral',label:connectionOk?'Stopping':'Off',title:connectionOk?'Shutting down':'Program off',detail:connectionOk?'Waiting for the program to stop.':'Open the __SYSTEM_NAME__ app to start it again.',overline:'PROGRAM POWER',icon:'power',alarmActive:false,quietRemaining:0});}
  const tone=status.tone==='healthy'?'':status.tone;
@@ -772,6 +779,7 @@ async function readFrame(){
 }
 
 // WIRING
+$('settings-sync-retry').addEventListener('click',()=>{if(pendingSettingsRetry)return runCommand('settings',pendingSettingsRetry);});
 document.querySelectorAll('[data-page]').forEach(button=>button.addEventListener('click',()=>navigate(button.dataset.page)));
 document.querySelectorAll('[data-go]').forEach(button=>button.addEventListener('click',()=>navigate(button.dataset.go,button.dataset.setup)));
 document.querySelectorAll('[data-setup-tab]').forEach(button=>button.addEventListener('click',()=>chooseSetupTab(button.dataset.setupTab)));
