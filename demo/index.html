@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1015">
+  <meta name="description" content="Explore BarrierWatcher: an interactive, synthetic demonstration of entrance, exit and pedestrian alerts. Open source. Local processing. Human control.">
+  <title>BarrierWatcher — Interactive lab</title>
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./app.mjs"></script>
+</head>
+<body>
+  <a class="skip" href="#lab">Skip to interactive demo</a>
+  <header class="site-header">
+    <a class="brand" href="#" aria-label="BarrierWatcher home"><span class="brand-mark" aria-hidden="true"><i></i><b></b></span>BarrierWatcher<span class="brand-version">LAB / 01</span></a>
+    <nav aria-label="Main"><a href="#lab">Live demo</a><a href="#technology">Under the hood</a><a class="source-link" href="https://github.com/Assembler-Fourier/c500-guard" target="_blank" rel="noopener noreferrer">Source code <span aria-hidden="true">↗</span></a></nav>
+  </header>
+
+  <main>
+    <section class="intro" aria-labelledby="page-title">
+      <div><p class="eyebrow"><span class="live-dot"></span> OPEN SOURCE · BUILT FOR THE OPERATOR</p><h1 id="page-title">Every arrival.<br><span>A signal to act.</span></h1><p class="intro-copy">A camera, a clear picture, an earlier heads-up.<br>Explore the logic behind a more attentive gate.</p></div>
+      <div class="intro-aside"><span class="index-label">01 / INTERACTIVE FIELD LAB</span><p>Meet the traffic.<br>Take the controls.</p><a href="#lab" class="round-link" aria-label="Explore the live demo">↓</a></div>
+    </section>
+
+    <section id="lab" class="lab" aria-labelledby="lab-title">
+      <div class="section-bar"><div><span class="eyebrow">THE LIVE LAB</span><h2 id="lab-title">A little campus. A lot happening.</h2></div><span class="simulation-label"><span></span>SYNTHETIC SIMULATION</span></div>
+      <div class="scenario-strip" aria-label="Choose a traffic scenario" id="scenario-controls"></div>
+      <div class="lab-grid">
+        <div class="scene-card">
+          <div class="scene-toolbar"><div class="scene-name"><span class="live-dot"></span><strong>North gate</strong><span>Virtual camera 01</span></div><div class="toolbar-buttons"><button id="lighting" class="icon-button" aria-label="Switch to day view" title="Switch to day view">☾ <span>Night</span></button><button id="zones" class="icon-button" aria-pressed="true" title="Toggle route overlays">⌗ <span>Zones</span></button><button id="expand" class="icon-button" aria-label="Expand scene" title="Expand scene">⛶</button></div></div>
+          <div class="scene-wrap" id="scene-wrap"><canvas id="scene" role="img" aria-label="Animated fictional campus with an entrance lane, an exit lane, a footpath and simulated road users."></canvas><div class="scene-topline"><span class="camera-tag">BW / NORTH GATE</span><span id="sim-clock">00:00</span></div><div class="scene-badge" id="scene-badge"><span class="live-dot"></span><span>Guided tour</span></div><div class="scene-bottomline"><span>GENERATED SCENE · NO REAL FOOTAGE</span><span id="scene-objects">0 TRACKS</span></div></div>
+          <div class="scene-controls"><div class="legend"><span class="entrance-dot">Entrance</span><span class="exit-dot">Exit</span><span class="pedestrian-dot">Footpath</span></div><div class="playback"><button id="restart" title="Restart scenario" aria-label="Restart scenario">↺</button><button id="pause" aria-label="Pause simulation">Ⅱ <span>Pause</span></button><button id="speed" aria-label="Playback speed: 1 times">1×</button></div></div>
+          <div class="scene-description"><span class="micro-label">SCENARIO NOTE</span><p id="scenario-note"></p></div>
+        </div>
+
+        <aside class="operator-panel" aria-label="Operator controls">
+          <div class="status-card" id="status-card" data-state="watching"><div class="status-top"><span class="micro-label">OPERATOR DESK</span><span id="status-pill" class="pill">Watching</span></div><div id="status-symbol" class="status-symbol" aria-hidden="true">⌁</div><p class="micro-label" id="alarm-lane">ALL ROUTES</p><h3 id="status-title">Watching the gate.</h3><p id="status-detail">Every new visit gets its own attention.</p><button id="acknowledge" class="acknowledge" disabled><span>✓</span> Acknowledge <kbd>A</kbd></button><div class="quiet-row"><span id="quiet-label">No active alert</span><span id="quiet-value"></span></div><div class="quiet-track"><span id="quiet-progress"></span></div></div>
+          <div class="barrier-controls"><div class="barrier-heading"><span class="micro-label">VIRTUAL BARRIERS</span><span>YOU'RE IN CONTROL</span></div><div class="barrier-row"><div><span class="entrance-dot">Entrance</span><small id="entrance-state">Down</small></div><button id="serve-entrance">Open &amp; serve <span>↗</span></button></div><div class="barrier-row"><div><span class="exit-dot">Exit</span><small id="exit-state">Down</small></div><button id="serve-exit">Open &amp; serve <span>↗</span></button></div></div>
+          <div class="audio-row"><button id="sound" aria-pressed="false"><span aria-hidden="true">♫</span><span>Sound off</span></button><span>OPTIONAL DEMO TONES</span></div>
+        </aside>
+      </div>
+
+      <div class="telemetry-grid"><div class="feed-card"><div class="card-heading"><h3>Signal feed</h3><span class="micro-label">SIMULATED EVENTS</span></div><ol id="event-feed" aria-label="Simulation events"></ol></div><div class="tracks-card"><div class="card-heading"><h3>In the picture</h3><span class="micro-label" id="track-count">0 TRACKS</span></div><div id="track-list"></div></div><div class="principle-card"><span class="micro-label">THE PRINCIPLE</span><p>One visit.<br>One acknowledgement.<br><em>A new car is a new story.</em></p><div class="stat-row"><span><strong id="arrival-count">0</strong>Arrivals</span><span><strong id="alert-count">0</strong>Alerts</span><span><strong id="ack-count">0</strong>Resolved</span></div></div></div>
+      <p class="simulation-note">This browser demo uses scripted traffic and simulated decisions. It runs locally in your tab, has no camera connection, and does not run the production AI. Opening a barrier here only changes the animation.</p>
+      <p id="announcer" class="sr-only" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="technology" class="technology" aria-labelledby="technology-title"><div class="section-bar"><div><span class="eyebrow">BEHIND THE SIGNAL</span><h2 id="technology-title">Pixels become a reason to look.</h2></div><span class="index-label">02 / THE REAL SYSTEM</span></div><p class="section-copy">The installed application combines several kinds of evidence. Follow the path from a fresh frame to an operator alert.</p><div class="pipeline" id="pipeline" aria-label="Explore the processing pipeline"></div><div class="tech-detail"><div><span id="tech-number" class="tech-number">01</span><div><span class="eyebrow" id="tech-tag">FRESHNESS FIRST</span><h3 id="tech-title">A current picture.</h3></div></div><p id="tech-copy"></p><div class="tech-tags" id="tech-tags"></div></div>
+        <div class="engineering-grid"><article><span class="feature-icon" aria-hidden="true">⌖</span><h3>Routes, with context.</h3><p>Separate entrance, exit and pedestrian areas. Image-change cues complement object detections when lights or partial vehicles arrive first.</p></article><article><span class="feature-icon" aria-hidden="true">↝</span><h3>Visits, beyond boxes.</h3><p>Tracking and visit memory connect observations over time. A following vehicle must keep its own identity and acknowledgement state.</p></article><article><span class="feature-icon" aria-hidden="true">◉</span><h3>The operator stays central.</h3><p>Lane tones, explicit acknowledgement and observed barrier states support the person at the desk. The app does not operate physical barriers.</p></article></div>
+    </section>
+
+    <section class="open-section" aria-labelledby="open-title"><div><span class="eyebrow">OPEN BY DESIGN</span><h2 id="open-title">Explore the code.<br><span>Understand the decisions.</span></h2><p>Python and OpenCV at the core. Optional accelerated inference.<br>A local dashboard, with the evidence kept on the installation machine.</p><a class="primary-link" href="https://github.com/Assembler-Fourier/c500-guard" target="_blank" rel="noopener noreferrer">Explore on GitHub <span>↗</span></a></div><div class="verification-card"><span class="micro-label">VERIFICATION, WITH CONTEXT</span><strong>60,000</strong><span>SYNTHETIC TEST EPISODES</span><p>The November 22 repair release exercised 75,000 simulated vehicles and people through decision tests. This measures those test cases, not real-camera detection accuracy.</p><a href="https://github.com/Assembler-Fourier/c500-guard/blob/main/docs/FIXES-2026-11-22.md" target="_blank" rel="noopener noreferrer">Read the results &amp; limits <span>↗</span></a></div></section>
+  </main>
+  <footer><a class="brand" href="#"><span class="brand-mark" aria-hidden="true"><i></i><b></b></span>BarrierWatcher</a><span>Original synthetic scene. No campus footage or vehicle data.</span><a href="https://github.com/Assembler-Fourier/c500-guard/blob/main/docs/DEMO.md" target="_blank" rel="noopener noreferrer">About this demo ↗</a></footer>
+  <noscript><p class="noscript">Enable JavaScript to run the interactive simulation. The project documentation is available on GitHub.</p></noscript>
+</body>
+</html>

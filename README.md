@@ -1,5 +1,9 @@
 # BarrierWatcher / c500-guard
 
+**[Try the interactive browser demo →](https://assembler-fourier.github.io/c500-guard/)**
+
+Animated traffic, virtual barrier controls, day/night scenes and an explorable technology pipeline. No installation required. [About the demo](docs/DEMO.md). All scenes and decisions are synthetic; it does not connect to a camera or run the production AI.
+
 A local camera dashboard and attention alarm for a supervised entrance, exit and pedestrian route. Python processes the camera feed; a browser or optional Windows WebView2 window displays the controls. Camera calibration, models and recordings remain on the installation machine.
 
 The application combines object observations, configured route geometry, image-change cues and separately calibrated barrier evidence. It provides lane-specific alarm tones, acknowledgement, visit grouping, stale-camera warnings, local incident recording and an optional vehicle appearance report. It does not operate a physical barrier. Detection and appearance matching can be wrong or late; they assist an operator and do not establish identity or guarantee that a vehicle was detected.
