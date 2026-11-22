@@ -1,5 +1,5 @@
-import { Simulation, SCENARIOS } from './simulation.mjs';
-import { SceneRenderer } from './scene.mjs';
+import { Simulation, SCENARIOS } from './simulation.mjs?v=__DEMO_VERSION__';
+import { SceneRenderer } from './scene.mjs?v=__DEMO_VERSION__';
 
 const $ = (id) => document.getElementById(id);
 const simulation = new Simulation();

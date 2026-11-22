@@ -42,4 +42,6 @@ Behavioral tests cover early contacts, per-visit acknowledgement, a distinct fol
 
 `.github/workflows/demo-pages.yml` runs the demo tests, packages an explicit seven-file asset allow-list, and deploys to GitHub Pages on relevant pushes to `main` or manual workflow dispatch. GitHub Pages must use **GitHub Actions** as its publishing source. The Pages artifact contains no production source, camera settings, recordings, model weights, calibration, logs or vehicle data. Hosting is public; footage and installation-specific configuration stay private.
 
+The workflow stamps asset URLs with the deployed commit, including imported modules. This prevents a refreshed HTML page from mixing in a browser-cached version of the previous controls. The placeholder query string also works unchanged on the local preview server.
+
 To update the experience, edit `demo/`, run its tests, inspect desktop/mobile layouts and keyboard/audio behavior, then push. Changes to the demo do not deploy or restart the installed alarm application.

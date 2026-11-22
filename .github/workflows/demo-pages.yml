@@ -31,6 +31,7 @@ jobs:
         run: |
           mkdir site
           cp demo/index.html demo/styles.css demo/app.mjs demo/scene.mjs demo/simulation.mjs demo/favicon.svg demo/.nojekyll site/
+          sed -i "s/__DEMO_VERSION__/${GITHUB_SHA}/g" site/index.html site/app.mjs
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:
